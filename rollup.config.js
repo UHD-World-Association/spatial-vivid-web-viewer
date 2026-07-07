@@ -1,9 +1,27 @@
 import { base64 } from "./util/import-base-64.js";
 import terser from '@rollup/plugin-terser';
+import url from '@rollup/plugin-url';
 
 const globals = {
     'three': 'THREE'
 };
+
+const externalWasmArtifacts = [
+    '**/splat_uwa_wasm.wasm',
+    '**/splat_uwa_reconstruction_wasm.wasm'
+];
+
+const customWasmUrlPlugin = url({
+    include: externalWasmArtifacts,
+    limit: 0,
+    fileName: '[name][extname]',
+    destDir: 'build'
+});
+
+const standardWasmBase64Plugin = base64({
+    include: ["**/*.wasm"],
+    exclude: externalWasmArtifacts
+});
 
 export default [
     {
@@ -32,7 +50,8 @@ export default [
             }
         ],
         plugins: [
-            base64({ include: "**/*.wasm" })
+            customWasmUrlPlugin,
+            standardWasmBase64Plugin
         ]
     },
     {
@@ -57,10 +76,8 @@ export default [
             }
         ],
         plugins: [
-            base64({ 
-                include: "**/*.wasm",
-                sourceMap: false
-            })
+            customWasmUrlPlugin,
+            standardWasmBase64Plugin
         ]
     }
 ];

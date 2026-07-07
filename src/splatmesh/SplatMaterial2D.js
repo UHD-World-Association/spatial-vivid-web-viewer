@@ -26,7 +26,7 @@ export class SplatMaterial2D {
         `;
 
         let vertexShaderSource = SplatMaterial.buildVertexShaderBase(dynamicMode, enableOptionalEffects,
-                                                                     maxSphericalHarmonicsDegree, customVertexVars);
+                                                                     maxSphericalHarmonicsDegree, false, customVertexVars);
         vertexShaderSource += SplatMaterial2D.buildVertexShaderProjection();
         const fragmentShaderSource = SplatMaterial2D.buildFragmentShader();
 
@@ -292,8 +292,7 @@ export class SplatMaterial2D {
 
             uniform vec3 debugColor;
 
-            varying vec4 vColor;
-            varying vec2 vUv;
+            flat varying vec4 vColor;
             varying vec2 vPosition;
             varying mat3 vT;
             varying vec2 vQuadCenter;

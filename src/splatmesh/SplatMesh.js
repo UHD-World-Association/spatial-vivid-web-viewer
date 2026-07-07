@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { SplatMaterial3D } from './SplatMaterial3D.js';
 import { SplatMaterial2D } from './SplatMaterial2D.js';
+import { getCompressedTextureSampleAddress } from './SplatMaterial.js';
 import { SplatGeometry } from './SplatGeometry.js';
 import { SplatScene } from './SplatScene.js';
 import { SplatTree } from '../splattree/SplatTree.js';
@@ -12,6 +13,7 @@ import { SceneRevealMode } from '../SceneRevealMode.js';
 import { SplatRenderMode } from '../SplatRenderMode.js';
 import { LogLevel } from '../LogLevel.js';
 import { clamp, getSphericalHarmonicsComponentCountForDegree } from '../Util.js';
+import { UwaPostprocessSplatBuffer } from '../loaders/splatUWA/postprocess/UwaPostprocess.js';
 
 const dummyGeometry = new THREE.BufferGeometry();
 const dummyMaterial = new THREE.MeshBasicMaterial();
@@ -31,6 +33,145 @@ const SCENE_FADEIN_RATE_FAST = 0.012;
 const SCENE_FADEIN_RATE_GRADUAL = 0.003;
 
 const VISIBLE_REGION_EXPANSION_DELTA = 1;
+const EMPTY_UINT32_ARRAY = new Uint32Array(0);
+
+const ASTC_FORMATS = {
+    '4x4': THREE.RGBA_ASTC_4x4_Format,
+    '5x5': THREE.RGBA_ASTC_5x5_Format,
+    '6x6': THREE.RGBA_ASTC_6x6_Format,
+    '8x8': THREE.RGBA_ASTC_8x8_Format,
+    '10x10': THREE.RGBA_ASTC_10x10_Format,
+    '12x12': THREE.RGBA_ASTC_12x12_Format
+};
+
+function compressedTextureThreeFormat(format, blockWidth, blockHeight) {
+    if (format === 'astc') return ASTC_FORMATS[`${blockWidth}x${blockHeight}`];
+    if (blockWidth !== 4 || blockHeight !== 4) return undefined;
+    if (format === 'bc7') return THREE.RGBA_BPTC_Format;
+    if (format === 'bc3') return THREE.RGBA_S3TC_DXT5_Format;
+    return undefined;
+}
+
+function validateCompressedTexturePayload(payload) {
+    if (!payload || typeof payload !== 'object') throw new Error('Compressed texture payload is missing.');
+    const { format, raw, metas } = payload;
+    const width = Number(payload.width ?? metas?.[1]);
+    const height = Number(payload.height ?? metas?.[2]);
+    const layers = Number(payload.layers ?? (metas ? metas.length / 6 : 0));
+    const blockWidth = Number(payload.blockWidth ?? metas?.[0]);
+    const blockHeight = Number(payload.blockHeight ?? metas?.[0]);
+    const singleWidth = Number(payload.singleWidth ?? metas?.[3]);
+    const regionPixelCount = Number(payload.regionPixelCount ?? metas?.[4]);
+    const singleHeight = Number(payload.singleHeight ?? regionPixelCount / singleWidth);
+    const threeFormat = compressedTextureThreeFormat(format, blockWidth, blockHeight);
+
+    if (!(raw instanceof Uint8Array) || raw.byteLength === 0) {
+        throw new Error(`Compressed texture payload ${format || 'unknown'} has no byte data.`);
+    }
+    if (![width, height, layers, blockWidth, blockHeight, singleWidth, singleHeight,
+        regionPixelCount].every(Number.isInteger) ||
+        width <= 0 || height <= 0 || layers <= 0 || blockWidth <= 0 || blockHeight <= 0 || singleWidth <= 0 ||
+        singleHeight <= 0 || regionPixelCount !== singleWidth * singleHeight ||
+        singleWidth > width || singleHeight > height || width > 16384 || height > 16384 || layers !== 1 || !threeFormat ||
+        !Number.isFinite(payload.shnMin) || !Number.isFinite(payload.shnMax) || payload.shnMax < payload.shnMin) {
+        throw new Error(`Compressed texture payload ${format || 'unknown'} has invalid format or dimensions.`);
+    }
+    if (metas && (metas.length !== layers * 6 ||
+        payload.textureNum !== undefined && payload.textureNum !== layers)) {
+        throw new Error(`Compressed texture payload ${format} has inconsistent layer metadata.`);
+    }
+    if (metas) {
+        let metadataBytes = 0;
+        for (let layer = 0; layer < layers; layer++) {
+            const offset = layer * 6;
+            if (metas[offset] !== blockWidth || metas[offset + 1] !== width ||
+                metas[offset + 2] !== height || metas[offset + 3] !== singleWidth ||
+                metas[offset + 4] !== regionPixelCount) {
+                throw new Error(`Compressed texture payload ${format} has incompatible array-layer metadata.`);
+            }
+            metadataBytes += metas[offset + 5];
+        }
+        if (metadataBytes !== raw.byteLength) {
+            throw new Error(`Compressed texture payload ${format} stream sizes do not match its byte data.`);
+        }
+    }
+
+    const expectedRawSize = Math.ceil(width / blockWidth) * Math.ceil(height / blockHeight) * 16 * layers;
+    if (raw.byteLength !== expectedRawSize) {
+        throw new Error(
+            `Compressed texture payload ${format} has ${raw.byteLength} bytes; expected ${expectedRawSize}.`
+        );
+    }
+    if (payload.uvs instanceof Uint32Array && payload.uvs.length >= 2) {
+        const shDegree = Math.max(1, Math.min(3, Number(payload.shDegree) || 1));
+        const coefficientCount = getSphericalHarmonicsComponentCountForDegree(shDegree) / 3;
+        const lastAddress = getCompressedTextureSampleAddress(
+            payload.uvs[0], payload.uvs[1], coefficientCount - 1,
+            singleWidth, singleHeight, width
+        );
+        if (lastAddress.x >= width || lastAddress.y >= height || lastAddress.layer !== 0) {
+            throw new Error(`Compressed texture payload ${format} cannot address its SH regions.`);
+        }
+    }
+    return {
+        format, raw, width, height, layers, blockWidth, blockHeight,
+        singleWidth, singleHeight, threeFormat
+    };
+}
+
+function absoluteNowMs() {
+    try {
+        const timeOrigin = performance.timeOrigin;
+        const now = performance.now();
+        const absolute = timeOrigin + now;
+        if (Number.isFinite(timeOrigin) && Number.isFinite(now) && Number.isFinite(absolute)) return absolute;
+    } catch (_) {}
+    return Date.now();
+}
+
+function absoluteFromPerformanceMs(value) {
+    try {
+        const timeOrigin = performance.timeOrigin;
+        if (Number.isFinite(timeOrigin) && Number.isFinite(value)) return timeOrigin + value;
+    } catch (_) {}
+    return undefined;
+}
+
+function addProcessingTimelineEvent(processingProfile, id, startAbsMs, endAbsMs) {
+    if (!processingProfile || !Number.isFinite(startAbsMs) || !Number.isFinite(endAbsMs) || endAbsMs < startAbsMs) return;
+    let events = processingProfile.__timelineEvents;
+    if (!Array.isArray(events)) {
+        events = [];
+        try {
+            Object.defineProperty(processingProfile, '__timelineEvents', {
+                value: events,
+                enumerable: false,
+                configurable: true
+            });
+        } catch (_) {
+            processingProfile.__timelineEvents = events;
+        }
+    }
+    events.push({
+        id: `mesh.${id}`,
+        lane: 'main.mesh',
+        task: id,
+        startAbsMs,
+        endAbsMs,
+        durationMs: endAbsMs - startAbsMs,
+        source: 'SplatMesh.js',
+        evidence: 'measured'
+    });
+}
+
+const recordProcessingDuration = (processingProfile, key, startTime) => {
+    if (!processingProfile) return;
+    const endTime = performance.now();
+    const elapsedMs = endTime - startTime;
+    processingProfile[key] = (processingProfile[key] || 0) + elapsedMs;
+    addProcessingTimelineEvent(processingProfile, key,
+        absoluteFromPerformanceMs(startTime), absoluteFromPerformanceMs(endTime) ?? absoluteNowMs());
+};
 
 // Based on my own observations across multiple devices, OSes and browsers, using textures that have one dimension
 // greater than 4096 while the other is greater than or equal to 4096 causes issues (Essentially any texture larger
@@ -40,6 +181,32 @@ const VISIBLE_REGION_EXPANSION_DELTA = 1;
 // but for now the work-around is to split the spherical harmonics into three textures (one for each color channel).
 const MAX_TEXTURE_TEXELS = 16777216;
 
+function computeDataTextureSize(elementsPerTexel, elementsPerSplat, maxSplatCount, previewBuild = false,
+                                allowOverMaxTextureSize = false) {
+    if (!Number.isFinite(elementsPerTexel) || elementsPerTexel <= 0 ||
+        !Number.isFinite(elementsPerSplat) || elementsPerSplat <= 0 ||
+        !Number.isSafeInteger(maxSplatCount) || maxSplatCount < 0) {
+        throw new RangeError('Invalid data texture size inputs.');
+    }
+    const width = previewBuild ? 1024 : 4096;
+    const requiredElements = maxSplatCount * elementsPerSplat;
+    if (!Number.isFinite(requiredElements) || requiredElements < 0 || requiredElements > Number.MAX_SAFE_INTEGER) {
+        throw new RangeError('Data texture size exceeds numeric precision.');
+    }
+    const requiredTexels = Math.ceil(requiredElements / elementsPerTexel);
+    let height = 1;
+    while (width * height < requiredTexels) {
+        if (!allowOverMaxTextureSize && width * height >= MAX_TEXTURE_TEXELS) {
+            throw new RangeError('Data texture size exceeds MAX_TEXTURE_TEXELS.');
+        }
+        height *= 2;
+    }
+    if (!allowOverMaxTextureSize && width * height > MAX_TEXTURE_TEXELS) {
+        throw new RangeError('Data texture size exceeds MAX_TEXTURE_TEXELS.');
+    }
+    return new THREE.Vector2(width, height);
+}
+
 /**
  * SplatMesh: Container for one or more splat scenes, abstracting them into a single unified container for
  * splat data. Additionally contains data structures and code to make the splat data renderable as a Three.js mesh.
@@ -48,8 +215,9 @@ export class SplatMesh extends THREE.Mesh {
 
     constructor(splatRenderMode = SplatRenderMode.ThreeD, dynamicMode = false, enableOptionalEffects = false,
                 halfPrecisionCovariancesOnGPU = false, devicePixelRatio = 1, enableDistancesComputationOnGPU = true,
-                integerBasedDistancesComputation = false, antialiased = false, maxScreenSpaceSplatSize = 1024, logLevel = LogLevel.None,
-                sphericalHarmonicsDegree = 0, sceneFadeInRateMultiplier = 1.0, kernel2DSize = 0.3) {
+                integerBasedDistancesComputation = false, antialiased = false, maxScreenSpaceSplatSize = 324, logLevel = LogLevel.None,
+                sphericalHarmonicsDegree = 0, sceneFadeInRateMultiplier = 1.0, kernel2DSize = 0.18,
+                minimumGaussianContribution = 1 / 1024, useDirectScaleRotationCovariance = true) {
         super(dummyGeometry, dummyMaterial);
 
         // Reference to a Three.js renderer
@@ -92,6 +260,15 @@ export class SplatMesh extends THREE.Mesh {
         // This will adjust the 2D kernel size after the projection
         this.kernel2DSize = kernel2DSize;
 
+        // Minimum alpha contribution retained by the 3D gaussian shader. The 2D splat path intentionally ignores it.
+        const requestedMinimumContribution = Number(minimumGaussianContribution);
+        this.minimumGaussianContribution = Number.isFinite(requestedMinimumContribution) ?
+            clamp(requestedMinimumContribution, 0, 1) : (1 / 1024);
+
+        // Online scale/rotation covariance is the default for UWA direct
+        // results. Pass false to use the experimental covariance texture path.
+        this.useDirectScaleRotationCovariance = useDirectScaleRotationCovariance !== false;
+
         // Specify the maximum clip space splat size, can help deal with large splats that get too unwieldy
         this.maxScreenSpaceSplatSize = maxScreenSpaceSplatSize;
 
@@ -113,6 +290,7 @@ export class SplatMesh extends THREE.Mesh {
 
         // Cache textures and the intermediate data used to populate them
         this.splatDataTextures = {};
+        this.generatedDataTextureBytes = {};
 
         this.distancesTransformFeedback = {
             'id': null,
@@ -130,6 +308,10 @@ export class SplatMesh extends THREE.Mesh {
 
         this.globalSplatIndexToLocalSplatIndexMap = [];
         this.globalSplatIndexToSceneIndexMap = [];
+        // A single scene whose global offset is zero has an implicit identity
+        // mapping. Keep this explicit so empty map arrays cannot be confused
+        // with an uninitialized or disposed mesh.
+        this.implicitSingleSceneIndexMap = false;
 
         this.lastBuildSplatCount = 0;
         this.lastBuildScenes = [];
@@ -151,9 +333,24 @@ export class SplatMesh extends THREE.Mesh {
         this.splatScale = 1.0;
         this.pointCloudModeEnabled = false;
 
+        this.useCompressedTexture = false;
+        // Compatibility alias retained for integrations that inspect this flag.
+        this.useASTC = false;
+
+        // A material retained after an early shader compile.  It is consumed by
+        // the first build whose complete shader variant key matches exactly.
+        this.precompiledMaterial = null;
+        this.precompiledMaterialKey = null;
+
         this.disposed = false;
         this.lastRenderer = null;
         this.visible = false;
+    }
+
+    static computeDataTextureSize(elementsPerTexel, elementsPerSplat, maxSplatCount, previewBuild = false,
+                                  allowOverMaxTextureSize = false) {
+        return computeDataTextureSize(elementsPerTexel, elementsPerSplat, maxSplatCount,
+                                      previewBuild, allowOverMaxTextureSize);
     }
 
     /**
@@ -194,6 +391,35 @@ export class SplatMesh extends THREE.Mesh {
         return new SplatScene(splatBuffer, position, rotation, scale, minimumAlpha, opacity, visible);
     }
 
+    buildFromUwaPostprocessResult(result, sceneOptions = [{}], finalBuild = true,
+                                  keepSceneTransforms = true, onSplatTreeIndexesUpload,
+                                  onSplatTreeConstruction, preserveVisibleRegion = true,
+                                  processingProfile = null) {
+        if (!result?.isUwaPostprocessResult && !(result instanceof UwaPostprocessSplatBuffer)) {
+            throw new Error('Invalid UWA postprocess result.');
+        }
+        const buffer = result instanceof UwaPostprocessSplatBuffer ? result : new UwaPostprocessSplatBuffer(result);
+        return this.build([buffer], sceneOptions, keepSceneTransforms, finalBuild,
+                          onSplatTreeIndexesUpload, onSplatTreeConstruction,
+                          preserveVisibleRegion, processingProfile);
+    }
+
+    /** Build directly from a UWA postprocess result without allocating an adapter object. */
+    buildFromUwaGpuData(result, sceneOptions = [{}], finalBuild = true,
+                        keepSceneTransforms = true, onSplatTreeIndexesUpload,
+                        onSplatTreeConstruction, preserveVisibleRegion = true,
+                        processingProfile = null) {
+        if (!result?.isUwaPostprocessResult) throw new Error('Invalid UWA postprocess GPU data result.');
+        const directResult = UwaPostprocessSplatBuffer.attachResult(result);
+        if (processingProfile) {
+            processingProfile.uwaGpuDataDirect = true;
+            processingProfile.uwaGpuBackend = result.backend || 'cpu';
+        }
+        return this.build([directResult], sceneOptions, keepSceneTransforms, finalBuild,
+                          onSplatTreeIndexesUpload, onSplatTreeConstruction,
+                          preserveVisibleRegion, processingProfile, result);
+    }
+
     /**
      * Build data structures that map global splat indexes (based on a unified index across all splat buffers) to
      * local data within a single scene.
@@ -201,6 +427,13 @@ export class SplatMesh extends THREE.Mesh {
      * @return {object}
      */
     static buildSplatIndexMaps(splatBuffers) {
+        if (splatBuffers.length === 1) {
+            return {
+                localSplatIndexMap: [],
+                sceneIndexMap: [],
+                implicitSingleSceneIndexMap: true
+            };
+        }
         const localSplatIndexMap = [];
         const sceneIndexMap = [];
         let totalSplatCount = 0;
@@ -215,7 +448,8 @@ export class SplatMesh extends THREE.Mesh {
         }
         return {
             localSplatIndexMap,
-            sceneIndexMap
+            sceneIndexMap,
+            implicitSingleSceneIndexMap: false
         };
     }
 
@@ -304,14 +538,32 @@ export class SplatMesh extends THREE.Mesh {
      * @return {object} Object containing info about the splats that are updated
      */
     build(splatBuffers, sceneOptions, keepSceneTransforms = true, finalBuild = false,
-          onSplatTreeIndexesUpload, onSplatTreeConstruction, preserveVisibleRegion = true) {
+          onSplatTreeIndexesUpload, onSplatTreeConstruction, preserveVisibleRegion = true, processingProfile = null,
+          uwaGpuData = null) {
+
+        const buildStartTime = performance.now();
 
         this.sceneOptions = sceneOptions;
         this.finalBuild = finalBuild;
 
+        const compressedTexturePayloads = splatBuffers.map((buffer) =>
+            buffer.compressedTextureData || buffer.astcData || null
+        );
+        this.useCompressedTexture = splatBuffers.some(b => b.hasCompressedTexture || b.hasAstc);
+        if (this.useCompressedTexture && compressedTexturePayloads.some((payload) => !payload)) {
+            throw new Error('Compressed-texture scenes cannot be mixed with uncompressed scenes in one SplatMesh.');
+        }
+        if (this.useCompressedTexture &&
+            compressedTexturePayloads.some((payload) => payload !== compressedTexturePayloads[0])) {
+            throw new Error('A SplatMesh cannot combine scenes backed by different compressed texture payloads.');
+        }
+        this.useASTC = this.useCompressedTexture;
+
         const maxSplatCount = SplatMesh.getTotalMaxSplatCountForSplatBuffers(splatBuffers);
 
+        const scenesStartTime = performance.now();
         const newScenes = SplatMesh.buildScenes(this, splatBuffers, sceneOptions);
+        recordProcessingDuration(processingProfile, 'meshBuildScenesMs', scenesStartTime);
         if (keepSceneTransforms) {
             for (let i = 0; i < this.scenes.length && i < newScenes.length; i++) {
                 const newScene = newScenes[i];
@@ -323,13 +575,17 @@ export class SplatMesh extends THREE.Mesh {
 
         let minSphericalHarmonicsDegree = 3;
         for (let splatBuffer of splatBuffers) {
-            const splatBufferSphericalHarmonicsDegree = splatBuffer.getMinSphericalHarmonicsDegree();
-            if (splatBufferSphericalHarmonicsDegree < minSphericalHarmonicsDegree) {
-                minSphericalHarmonicsDegree = splatBufferSphericalHarmonicsDegree;
+            let bufferDegree = splatBuffer.getMinSphericalHarmonicsDegree();
+
+            const compressedTextureData = splatBuffer.compressedTextureData || splatBuffer.astcData;
+            if (compressedTextureData?.shDegree !== undefined) {
+                bufferDegree = compressedTextureData.shDegree;
+            }
+            if (bufferDegree < minSphericalHarmonicsDegree) {
+                minSphericalHarmonicsDegree = bufferDegree;
             }
         }
         this.minSphericalHarmonicsDegree = Math.min(minSphericalHarmonicsDegree, this.sphericalHarmonicsDegree);
-
         let splatBuffersChanged = false;
         if (splatBuffers.length !== this.lastBuildScenes.length) {
             splatBuffersChanged = true;
@@ -364,24 +620,45 @@ export class SplatMesh extends THREE.Mesh {
             this.lastBuildSplatCount = 0;
             this.lastBuildMaxSplatCount = 0;
             this.disposeMeshData();
+            const geometryMaterialStartTime = performance.now();
             this.geometry = SplatGeometry.build(maxSplatCount);
+            const covarianceFromScaleRotation = !!uwaGpuData && this.useDirectScaleRotationCovariance;
+            const materialKey = this.getMaterialVariantKey({
+                useCompressedTexture: this.useCompressedTexture,
+                covariancesFromScaleRotation: covarianceFromScaleRotation,
+                minSphericalHarmonicsDegree: this.minSphericalHarmonicsDegree
+            });
+            const retainedMaterial = this.takePrecompiledMaterial(materialKey);
             if (this.splatRenderMode === SplatRenderMode.ThreeD) {
-                this.material = SplatMaterial3D.build(this.dynamicMode, this.enableOptionalEffects, this.antialiased,
-                                                      this.maxScreenSpaceSplatSize, this.splatScale, this.pointCloudModeEnabled,
-                                                      this.minSphericalHarmonicsDegree, this.kernel2DSize);
+                this.material = retainedMaterial || SplatMaterial3D.build(
+                    this.dynamicMode, this.enableOptionalEffects, this.antialiased,
+                    this.maxScreenSpaceSplatSize, this.splatScale, this.pointCloudModeEnabled,
+                    this.minSphericalHarmonicsDegree, this.kernel2DSize, this.useCompressedTexture,
+                    covarianceFromScaleRotation, this.minimumGaussianContribution);
             } else {
-                this.material = SplatMaterial2D.build(this.dynamicMode, this.enableOptionalEffects,
-                                                      this.splatScale, this.pointCloudModeEnabled, this.minSphericalHarmonicsDegree);
+                this.material = retainedMaterial || SplatMaterial2D.build(
+                    this.dynamicMode, this.enableOptionalEffects,
+                    this.splatScale, this.pointCloudModeEnabled, this.minSphericalHarmonicsDegree);
             }
 
+            recordProcessingDuration(processingProfile, 'meshBuildGeometryMaterialMs', geometryMaterialStartTime);
+            const indexMapsStartTime = performance.now();
             const indexMaps = SplatMesh.buildSplatIndexMaps(splatBuffers);
+            recordProcessingDuration(processingProfile, 'meshBuildIndexMapsMs', indexMapsStartTime);
             this.globalSplatIndexToLocalSplatIndexMap = indexMaps.localSplatIndexMap;
             this.globalSplatIndexToSceneIndexMap = indexMaps.sceneIndexMap;
+            this.implicitSingleSceneIndexMap = indexMaps.implicitSingleSceneIndexMap;
         }
 
         const splatBufferSplatCount = this.getSplatCount(true);
         if (this.enableDistancesComputationOnGPU) this.setupDistancesComputationTransformFeedback();
-        const dataUpdateResults = this.refreshGPUDataFromSplatBuffers(isUpdateBuild);
+        this._uwaGpuDataDirect = uwaGpuData;
+        let dataUpdateResults;
+        try {
+            dataUpdateResults = this.refreshGPUDataFromSplatBuffers(isUpdateBuild, processingProfile);
+        } finally {
+            this._uwaGpuDataDirect = null;
+        }
 
         for (let i = 0; i < this.scenes.length; i++) {
             this.lastBuildScenes[i] = this.scenes[i];
@@ -390,10 +667,13 @@ export class SplatMesh extends THREE.Mesh {
         this.lastBuildMaxSplatCount = this.getMaxSplatCount();
         this.lastBuildSceneCount = this.scenes.length;
 
+        let splatTreePromise = null;
         if (finalBuild && this.scenes.length > 0) {
-            this.buildSplatTree(sceneOptions.map(options => options.splatAlphaRemovalThreshold || 1),
-                                onSplatTreeIndexesUpload, onSplatTreeConstruction)
+            const splatTreeStartTime = performance.now();
+            splatTreePromise = this.buildSplatTree(sceneOptions.map(options => options.splatAlphaRemovalThreshold || 1),
+                                                   onSplatTreeIndexesUpload, onSplatTreeConstruction)
             .then(() => {
+                recordProcessingDuration(processingProfile, 'splatTreeAsyncMs', splatTreeStartTime);
                 if (this.onSplatTreeReadyCallback) this.onSplatTreeReadyCallback(this.splatTree);
                 this.onSplatTreeReadyCallback = null;
             });
@@ -401,7 +681,114 @@ export class SplatMesh extends THREE.Mesh {
 
         this.visible = (this.scenes.length > 0);
 
+        if (processingProfile) {
+            const buildEndTime = performance.now();
+            processingProfile.meshBuildTotalMs = buildEndTime - buildStartTime;
+            addProcessingTimelineEvent(processingProfile, 'meshBuildTotal',
+                absoluteFromPerformanceMs(buildStartTime), absoluteFromPerformanceMs(buildEndTime) ?? absoluteNowMs());
+            processingProfile.meshRebuild = !isUpdateBuild;
+            processingProfile.meshSplatCount = splatBufferSplatCount;
+            processingProfile.meshMaxSplatCount = this.getMaxSplatCount();
+            processingProfile.splatTreeAsyncStarted = !!(finalBuild && this.scenes.length > 0);
+            dataUpdateResults.processingProfile = processingProfile;
+        }
+        dataUpdateResults.splatTreePromise = splatTreePromise;
+
         return dataUpdateResults;
+    }
+
+    /**
+     * Return the complete shader variant key used by the material builders.
+     * Callers must provide the final minimum SH degree when precompiling.
+     */
+    getMaterialVariantKey(options = {}) {
+        const minSphericalHarmonicsDegree = Number.isInteger(options.minSphericalHarmonicsDegree) ?
+            Math.max(0, Math.min(3, options.minSphericalHarmonicsDegree)) : this.minSphericalHarmonicsDegree;
+        const requestedMinimumContribution = Number(options.minimumGaussianContribution ?? this.minimumGaussianContribution);
+        const minimumGaussianContribution = Number.isFinite(requestedMinimumContribution) ?
+            Math.min(Math.max(requestedMinimumContribution, 0), 1) : (1 / 1024);
+        return JSON.stringify([
+            this.splatRenderMode,
+            !!this.dynamicMode,
+            !!this.enableOptionalEffects,
+            !!this.antialiased,
+            Number(this.maxScreenSpaceSplatSize),
+            Number(this.splatScale),
+            !!this.pointCloudModeEnabled,
+            minSphericalHarmonicsDegree,
+            Number(this.kernel2DSize),
+            !!(options.useCompressedTexture ?? this.useCompressedTexture),
+            !!(options.covariancesFromScaleRotation ?? this.useDirectScaleRotationCovariance),
+            minimumGaussianContribution
+        ]);
+    }
+
+    /**
+     * Compile a material variant against a temporary one-instance mesh. The
+     * geometry is discarded while the material is retained for the matching
+     * full data build.
+     */
+    precompileMaterial(options = {}) {
+        if (!this.renderer || !this.renderer.compile || !this.renderer.getContext || !options.camera) return false;
+        if (options.renderMode !== undefined && options.renderMode !== this.splatRenderMode) return false;
+        if (!Number.isInteger(options.minSphericalHarmonicsDegree)) return false;
+
+        const key = this.getMaterialVariantKey(options);
+        if (this.precompiledMaterial && this.precompiledMaterialKey === key) return true;
+        this.clearPrecompiledMaterial();
+
+        const useCompressedTexture = !!(options.useCompressedTexture ?? false);
+        const covariancesFromScaleRotation = !!(options.covariancesFromScaleRotation ??
+            this.useDirectScaleRotationCovariance);
+        if (this.splatRenderMode === SplatRenderMode.ThreeD &&
+            (covariancesFromScaleRotation && !useCompressedTexture)) return false;
+
+        const material = this.splatRenderMode === SplatRenderMode.ThreeD ?
+            SplatMaterial3D.build(this.dynamicMode, this.enableOptionalEffects, this.antialiased,
+                                  this.maxScreenSpaceSplatSize, this.splatScale, this.pointCloudModeEnabled,
+                                  Number(options.minSphericalHarmonicsDegree), this.kernel2DSize,
+                                  useCompressedTexture, covariancesFromScaleRotation,
+                                  this.minimumGaussianContribution) :
+            SplatMaterial2D.build(this.dynamicMode, this.enableOptionalEffects,
+                                  this.splatScale, this.pointCloudModeEnabled,
+                                  Number(options.minSphericalHarmonicsDegree));
+        const geometry = SplatGeometry.build(1);
+        geometry.instanceCount = 1;
+        geometry.getAttribute('splatIndex').setX(0, 0);
+        const temporaryScene = new THREE.Scene();
+        const temporaryMesh = new THREE.Mesh(geometry, material);
+        temporaryMesh.frustumCulled = false;
+        temporaryScene.add(temporaryMesh);
+        try {
+            this.renderer.compile(temporaryScene, options.camera);
+            this.precompiledMaterial = material;
+            this.precompiledMaterialKey = key;
+            return true;
+        } catch (error) {
+            material.dispose();
+            throw error;
+        } finally {
+            temporaryScene.remove(temporaryMesh);
+            geometry.dispose();
+        }
+    }
+
+    takePrecompiledMaterial(key) {
+        if (!this.precompiledMaterial) return null;
+        if (this.precompiledMaterialKey !== key) {
+            this.clearPrecompiledMaterial();
+            return null;
+        }
+        const material = this.precompiledMaterial;
+        this.precompiledMaterial = null;
+        this.precompiledMaterialKey = null;
+        return material;
+    }
+
+    clearPrecompiledMaterial() {
+        if (this.precompiledMaterial) this.precompiledMaterial.dispose();
+        this.precompiledMaterial = null;
+        this.precompiledMaterialKey = null;
     }
 
     freeIntermediateSplatData() {
@@ -418,12 +805,23 @@ export class SplatMesh extends THREE.Mesh {
         delete this.splatDataTextures.baseData.sphericalHarmonics;
 
         delete this.splatDataTextures.centerColors.data;
-        delete this.splatDataTextures.covariances.data;
+        if (this.splatDataTextures.covariances) {
+            delete this.splatDataTextures.covariances.data;
+        }
         if (this.splatDataTextures.sphericalHarmonics) {
             delete this.splatDataTextures.sphericalHarmonics.data;
         }
         if (this.splatDataTextures.sceneIndexes) {
             delete this.splatDataTextures.sceneIndexes.data;
+        }
+        if (this.splatDataTextures.compressedTexture) {
+            delete this.splatDataTextures.compressedTexture.data;
+        }
+        if (this.splatDataTextures.compressedTextureUV) {
+            delete this.splatDataTextures.compressedTextureUV.data;
+        }
+        if (this.splatDataTextures.scaleRotations) {
+            delete this.splatDataTextures.scaleRotations.data;
         }
 
         this.splatDataTextures.centerColors.texture.needsUpdate = true;
@@ -431,10 +829,19 @@ export class SplatMesh extends THREE.Mesh {
             deleteTextureData(this.splatDataTextures.centerColors.texture);
         };
 
-        this.splatDataTextures.covariances.texture.needsUpdate = true;
-        this.splatDataTextures.covariances.texture.onUpdate = () => {
-            deleteTextureData(this.splatDataTextures.covariances.texture);
-        };
+        if (this.splatDataTextures.covariances) {
+            this.splatDataTextures.covariances.texture.needsUpdate = true;
+            this.splatDataTextures.covariances.texture.onUpdate = () => {
+                deleteTextureData(this.splatDataTextures.covariances.texture);
+            };
+        }
+
+        if (this.splatDataTextures.scaleRotations) {
+            this.splatDataTextures.scaleRotations.texture.needsUpdate = true;
+            this.splatDataTextures.scaleRotations.texture.onUpdate = () => {
+                deleteTextureData(this.splatDataTextures.scaleRotations.texture);
+            };
+        }
 
         if (this.splatDataTextures.sphericalHarmonics) {
             if (this.splatDataTextures.sphericalHarmonics.texture) {
@@ -457,11 +864,32 @@ export class SplatMesh extends THREE.Mesh {
                 deleteTextureData(this.splatDataTextures.sceneIndexes.texture);
             };
         }
+        if (this.splatDataTextures.compressedTexture) {
+            const textureDescriptor = this.splatDataTextures.compressedTexture;
+            const compressedTexture = textureDescriptor.texture;
+            compressedTexture.needsUpdate = true;
+            compressedTexture.onUpdate = () => {
+                console.log(
+                    `[SplatUWA Timing] Compressed texture upload: ` +
+                    `${(performance.now() - textureDescriptor.uploadQueuedAt).toFixed(2)} ms, ` +
+                    `bytes=${textureDescriptor.byteLength}`
+                );
+                deleteTextureData(compressedTexture);
+            };
+        }
+        if (this.splatDataTextures.compressedTextureUV) {
+            const compressedTextureUV = this.splatDataTextures.compressedTextureUV.texture;
+            compressedTextureUV.needsUpdate = true;
+            compressedTextureUV.onUpdate = () => {
+                deleteTextureData(compressedTextureUV);
+            };
+        }
     }
     /**
      * Dispose all resources held by the splat mesh
      */
     dispose() {
+        this.clearPrecompiledMaterial();
         this.disposeMeshData();
         this.disposeTextures();
         this.disposeSplatTree();
@@ -490,6 +918,7 @@ export class SplatMesh extends THREE.Mesh {
 
         this.globalSplatIndexToLocalSplatIndexMap = [];
         this.globalSplatIndexToSceneIndexMap = [];
+        this.implicitSingleSceneIndexMap = false;
 
         this.lastBuildSplatCount = 0;
         this.lastBuildScenes = [];
@@ -510,6 +939,7 @@ export class SplatMesh extends THREE.Mesh {
 
         this.splatScale = 1.0;
         this.pointCloudModeEnabled = false;
+        this.generatedDataTextureBytes = {};
 
         this.disposed = true;
         this.lastRenderer = null;
@@ -534,7 +964,7 @@ export class SplatMesh extends THREE.Mesh {
         for (let textureKey in this.splatDataTextures) {
             if (this.splatDataTextures.hasOwnProperty(textureKey)) {
                 const textureContainer = this.splatDataTextures[textureKey];
-                if (textureContainer.texture) {
+                if (textureContainer?.texture) {
                     textureContainer.texture.dispose();
                     textureContainer.texture = null;
                 }
@@ -570,14 +1000,51 @@ export class SplatMesh extends THREE.Mesh {
      * @return {object}
      */
     getDataForDistancesComputation(start, end) {
-        const centers = this.integerBasedDistancesComputation ?
-                        this.getIntegerCenters(start, end, true) :
-                        this.getFloatCenters(start, end, true);
-        const sceneIndexes = this.getSceneIndexes(start, end);
+        const centers = this.getCentersForDistancesComputation(start, end, true);
+        const sceneIndexes = this.dynamicMode ? this.getSceneIndexes(start, end) : EMPTY_UINT32_ARRAY;
         return {
             centers,
             sceneIndexes
         };
+    }
+
+    getCentersForDistancesComputation(start, end, padFour = false) {
+        const baseCenters = this.splatDataTextures?.baseData?.centers;
+        if (!baseCenters) {
+            return this.integerBasedDistancesComputation ?
+                   this.getIntegerCenters(start, end, padFour) :
+                   this.getFloatCenters(start, end, padFour);
+        }
+
+        const splatCount = end - start + 1;
+        const componentCount = padFour ? 4 : 3;
+        const sourceBase = start * 3;
+
+        if (this.integerBasedDistancesComputation) {
+            const integerCenters = new Int32Array(splatCount * componentCount);
+            let srcOffset = sourceBase;
+            let dstOffset = 0;
+            for (let i = 0; i < splatCount; i++) {
+                integerCenters[dstOffset++] = Math.round(baseCenters[srcOffset++] * 1000.0);
+                integerCenters[dstOffset++] = Math.round(baseCenters[srcOffset++] * 1000.0);
+                integerCenters[dstOffset++] = Math.round(baseCenters[srcOffset++] * 1000.0);
+                if (padFour) integerCenters[dstOffset++] = 1000;
+            }
+            return integerCenters;
+        }
+
+        if (!padFour) return baseCenters.slice(sourceBase, sourceBase + splatCount * 3);
+
+        const paddedFloatCenters = new Float32Array(splatCount * 4);
+        let srcOffset = sourceBase;
+        let dstOffset = 0;
+        for (let i = 0; i < splatCount; i++) {
+            paddedFloatCenters[dstOffset++] = baseCenters[srcOffset++];
+            paddedFloatCenters[dstOffset++] = baseCenters[srcOffset++];
+            paddedFloatCenters[dstOffset++] = baseCenters[srcOffset++];
+            paddedFloatCenters[dstOffset++] = 1.0;
+        }
+        return paddedFloatCenters;
     }
 
     /**
@@ -585,20 +1052,38 @@ export class SplatMesh extends THREE.Mesh {
      * @param {boolean} sinceLastBuildOnly Specify whether or not to only update for splats that have been added since the last build.
      * @return {object}
      */
-    refreshGPUDataFromSplatBuffers(sinceLastBuildOnly) {
+    refreshGPUDataFromSplatBuffers(sinceLastBuildOnly, processingProfile = null) {
+        const refreshStartTime = performance.now();
         const splatCount = this.getSplatCount(true);
-        this.refreshDataTexturesFromSplatBuffers(sinceLastBuildOnly);
+        this.refreshDataTexturesFromSplatBuffers(sinceLastBuildOnly, processingProfile);
         const updateStart = sinceLastBuildOnly ? this.lastBuildSplatCount : 0;
-        const { centers, sceneIndexes } = this.getDataForDistancesComputation(updateStart, splatCount - 1);
-        if (this.enableDistancesComputationOnGPU) {
-            this.refreshGPUBuffersForDistancesComputation(centers, sceneIndexes, sinceLastBuildOnly);
+        if (processingProfile?.deferSortDataPrep && !this.enableDistancesComputationOnGPU) {
+            recordProcessingDuration(processingProfile, 'meshRefreshGpuDataMs', refreshStartTime);
+            return {
+                'from': updateStart,
+                'to': splatCount - 1,
+                'count': splatCount - updateStart,
+                'centers': null,
+                'sceneIndexes': null,
+                'deferredSortDataPrep': true
+            };
         }
+        const distanceDataStartTime = performance.now();
+        const { centers, sceneIndexes } = this.getDataForDistancesComputation(updateStart, splatCount - 1);
+        recordProcessingDuration(processingProfile, 'meshSortDataPrepMs', distanceDataStartTime);
+        if (this.enableDistancesComputationOnGPU) {
+            const gpuBufferRefreshStartTime = performance.now();
+            this.refreshGPUBuffersForDistancesComputation(centers, sceneIndexes, sinceLastBuildOnly);
+            recordProcessingDuration(processingProfile, 'meshGpuDistanceBufferUploadMs', gpuBufferRefreshStartTime);
+        }
+        recordProcessingDuration(processingProfile, 'meshRefreshGpuDataMs', refreshStartTime);
         return {
             'from': updateStart,
             'to': splatCount - 1,
             'count': splatCount - updateStart,
             'centers': centers,
-            'sceneIndexes': sceneIndexes
+            'sceneIndexes': sceneIndexes,
+            'deferredSortDataPrep': false
         };
     }
 
@@ -618,64 +1103,101 @@ export class SplatMesh extends THREE.Mesh {
      * Refresh data textures with data from the splat buffers for this mesh.
      * @param {boolean} sinceLastBuildOnly Specify whether or not to only update for splats that have been added since the last build.
      */
-    refreshDataTexturesFromSplatBuffers(sinceLastBuildOnly) {
+    refreshDataTexturesFromSplatBuffers(sinceLastBuildOnly, processingProfile = null) {
+        const refreshStartTime = performance.now();
         const splatCount = this.getSplatCount(true);
         const fromSplat = this.lastBuildSplatCount;
         const toSplat = splatCount - 1;
+        const deferVisibleRegionUpdate = !!processingProfile?.deferVisibleRegion && !sinceLastBuildOnly;
 
+        const directResult = !sinceLastBuildOnly ? this._uwaGpuDataDirect : null;
+        const directInstallStartedAt = directResult ? performance.now() : 0;
         if (!sinceLastBuildOnly) {
-            this.setupDataTextures();
-            this.updateBaseDataFromSplatBuffers();
+            const setupStartTime = performance.now();
+            this.setupDataTextures(directResult, !!processingProfile?.preview, processingProfile);
+            recordProcessingDuration(processingProfile, 'meshSetupDataTexturesMs', setupStartTime);
+            this.updateBaseDataFromSplatBuffers(0, splatCount-1, processingProfile);
         } else {
-            this.updateBaseDataFromSplatBuffers(fromSplat, toSplat);
+
+            this.updateBaseDataFromSplatBuffers(fromSplat, toSplat, processingProfile);
         }
 
-        this.updateDataTexturesFromBaseData(fromSplat, toSplat);
-        this.updateVisibleRegion(sinceLastBuildOnly);
+        if (directResult && processingProfile) {
+            processingProfile.uwaGpuDataDirect = true;
+            const directInstallEndedAt = performance.now();
+            processingProfile.uwaGpuDirectInstallMs = directInstallEndedAt - directInstallStartedAt;
+            addProcessingTimelineEvent(processingProfile, 'uwaGpuDirectInstall',
+                absoluteFromPerformanceMs(directInstallStartedAt),
+                absoluteFromPerformanceMs(directInstallEndedAt) ?? absoluteNowMs());
+            processingProfile.uwaGpuCovarianceSource = this.useDirectScaleRotationCovariance ?
+                'scale-rotation-shader' : 'covariance-texture';
+            processingProfile.uwaPostprocessBackend = directResult.backend;
+            processingProfile.uwaSourceArrayBytes = directResult.uwaPostprocessTimings?.sourceArrayBytes;
+            processingProfile.uwaOutputArrayBytes = directResult.uwaPostprocessTimings?.outputArrayBytes;
+            processingProfile.uwaCompactionDroppedCount = directResult.uwaPostprocessTimings?.compactionDroppedCount;
+            processingProfile.uwaGpuInputPackMs = directResult.uwaPostprocessTimings?.gpuInputPackMs;
+            processingProfile.workerGpuTexturePackMs = directResult.uwaPostprocessTimings?.workerGpuTexturePackMs;
+        }
+
+        this.updateDataTexturesFromBaseData(fromSplat, toSplat, processingProfile);
+        if (deferVisibleRegionUpdate) {
+            const visibleRegionPrimeStartTime = performance.now();
+            this.prepareVisibleRegionForImmediateRender();
+            recordProcessingDuration(processingProfile, 'meshPrimeVisibleRegionMs', visibleRegionPrimeStartTime);
+        } else {
+            const visibleRegionStartTime = performance.now();
+            this.updateVisibleRegion(sinceLastBuildOnly);
+            recordProcessingDuration(processingProfile, 'meshUpdateVisibleRegionMs', visibleRegionStartTime);
+        }
+        recordProcessingDuration(processingProfile, 'meshRefreshDataTexturesTotalMs', refreshStartTime);
     }
 
-    setupDataTextures() {
+    setupDataTextures(directResult = null, previewBuild = false, processingProfile = null) {
         const maxSplatCount = this.getMaxSplatCount();
         const splatCount = this.getSplatCount(true);
 
         this.disposeTextures();
-
-        const computeDataTextureSize = (elementsPerTexel, elementsPerSplat) => {
-            const texSize = new THREE.Vector2(4096, 1024);
-            while (texSize.x * texSize.y * elementsPerTexel < maxSplatCount * elementsPerSplat) texSize.y *= 2;
-            return texSize;
+        const generatedDataTextureBytes = {};
+        const recordGeneratedDataTexture = (name, data) => {
+            generatedDataTextureBytes[name] = (generatedDataTextureBytes[name] || 0) + (data?.byteLength || 0);
         };
+        const getDataTextureSize = (elementsPerTexel, elementsPerSplat) =>
+            SplatMesh.computeDataTextureSize(elementsPerTexel, elementsPerSplat, maxSplatCount, previewBuild);
 
         const getCovariancesElementsPertexelStored = (compressionLevel) => {
             return compressionLevel >= 1 ? COVARIANCES_ELEMENTS_PER_TEXEL_COMPRESSED_STORED : COVARIANCES_ELEMENTS_PER_TEXEL_STORED;
         };
 
-        const getCovariancesInitialTextureSpecs = (compressionLevel) => {
+        const getCovariancesInitialTextureSpecs = (compressionLevel, allowOverMaxTextureSize = false) => {
             const elementsPerTexelStored = getCovariancesElementsPertexelStored(compressionLevel);
-            const texSize = computeDataTextureSize(elementsPerTexelStored, 6);
+            const texSize = SplatMesh.computeDataTextureSize(elementsPerTexelStored, 6, maxSplatCount,
+                                                            previewBuild, allowOverMaxTextureSize);
             return {elementsPerTexelStored, texSize};
         };
 
         let covarianceCompressionLevel = this.getTargetCovarianceCompressionLevel();
         const scaleRotationCompressionLevel = 0;
         const shCompressionLevel = this.getTargetSphericalHarmonicsCompressionLevel();
+        const useDirectScaleRotationCovariance = !!(directResult &&
+            this.splatRenderMode === SplatRenderMode.ThreeD && this.useDirectScaleRotationCovariance);
+        this._uwaGpuRotationsAreWxyz = useDirectScaleRotationCovariance;
 
         let covariances;
         let scales;
         let rotations;
-        if (this.splatRenderMode === SplatRenderMode.ThreeD) {
-            const initialCovTexSpecs = getCovariancesInitialTextureSpecs(covarianceCompressionLevel);
+        if (this.splatRenderMode === SplatRenderMode.ThreeD && !useDirectScaleRotationCovariance) {
+            const initialCovTexSpecs = getCovariancesInitialTextureSpecs(covarianceCompressionLevel, true);
             if (initialCovTexSpecs.texSize.x * initialCovTexSpecs.texSize.y > MAX_TEXTURE_TEXELS && covarianceCompressionLevel === 0) {
                 covarianceCompressionLevel = 1;
             }
-            covariances = new Float32Array(maxSplatCount * COVARIANCES_ELEMENTS_PER_SPLAT);
+            covariances = directResult?.covariances || new Float32Array(maxSplatCount * COVARIANCES_ELEMENTS_PER_SPLAT);
         } else {
-            scales = new Float32Array(maxSplatCount * 3);
-            rotations = new Float32Array(maxSplatCount * 4);
+            scales = directResult?.scales || new Float32Array(maxSplatCount * 3);
+            rotations = directResult?.rotations || new Float32Array(maxSplatCount * 4);
         }
 
-        const centers = new Float32Array(maxSplatCount * 3);
-        const colors = new Uint8Array(maxSplatCount * 4);
+        const centers = directResult?.positions || new Float32Array(maxSplatCount * 3);
+        const colors = directResult?.colors || new Uint8Array(maxSplatCount * 4);
 
         let SphericalHarmonicsArrayType = Float32Array;
         if (shCompressionLevel === 1) SphericalHarmonicsArrayType = Uint16Array;
@@ -684,9 +1206,14 @@ export class SplatMesh extends THREE.Mesh {
         const shData = this.minSphericalHarmonicsDegree ? new SphericalHarmonicsArrayType(maxSplatCount * shComponentCount) : undefined;
 
         // set up centers/colors data texture
-        const centersColsTexSize = computeDataTextureSize(CENTER_COLORS_ELEMENTS_PER_TEXEL, 4);
-        const paddedCentersCols = new Uint32Array(centersColsTexSize.x * centersColsTexSize.y * CENTER_COLORS_ELEMENTS_PER_TEXEL);
-        SplatMesh.updateCenterColorsPaddedData(0, splatCount - 1, centers, colors, paddedCentersCols);
+        const centersColsTexSize = getDataTextureSize(CENTER_COLORS_ELEMENTS_PER_TEXEL, 4);
+        const centerColorsArrayLength = centersColsTexSize.x * centersColsTexSize.y * CENTER_COLORS_ELEMENTS_PER_TEXEL;
+        const directGpuCenterColors = directResult?.gpuCenterColors;
+        const useDirectPaddedCenterColors = directGpuCenterColors instanceof Uint32Array &&
+            directGpuCenterColors.length === centerColorsArrayLength;
+        const paddedCentersCols = useDirectPaddedCenterColors ? directGpuCenterColors : new Uint32Array(centerColorsArrayLength);
+        recordGeneratedDataTexture('centerColors', paddedCentersCols);
+        if (!directResult) SplatMesh.updateCenterColorsPaddedData(0, splatCount - 1, centers, colors, paddedCentersCols);
 
         const centersColsTex = new THREE.DataTexture(paddedCentersCols, centersColsTexSize.x, centersColsTexSize.y,
                                                      THREE.RGBAIntegerFormat, THREE.UnsignedIntType);
@@ -708,11 +1235,17 @@ export class SplatMesh extends THREE.Mesh {
             'centerColors': {
                 'data': paddedCentersCols,
                 'texture': centersColsTex,
-                'size': centersColsTexSize
+                'size': centersColsTexSize,
+                'gpuCenterColors': directResult?.gpuCenterColors || null,
+                'directPadded': useDirectPaddedCenterColors
             }
         };
 
-        if (this.splatRenderMode === SplatRenderMode.ThreeD) {
+        if (directResult?.compressedTextureData?.uvs) {
+            this.splatDataTextures.baseData.compressedTextureUVs = directResult.compressedTextureData.uvs;
+        }
+
+        if (this.splatRenderMode === SplatRenderMode.ThreeD && !useDirectScaleRotationCovariance) {
             // set up covariances data texture
 
             const covTexSpecs = getCovariancesInitialTextureSpecs(covarianceCompressionLevel);
@@ -724,10 +1257,11 @@ export class SplatMesh extends THREE.Mesh {
                                                          COVARIANCES_ELEMENTS_PER_TEXEL_COMPRESSED_ALLOCATED :
                                                          COVARIANCES_ELEMENTS_PER_TEXEL_ALLOCATED;
             const covariancesTextureData = new CovariancesDataType(covTexSize.x * covTexSize.y * covariancesElementsPerTexelAllocated);
+            recordGeneratedDataTexture('covariances', covariancesTextureData);
 
-            if (covarianceCompressionLevel === 0) {
+            if (covarianceCompressionLevel === 0 && !directResult) {
                 covariancesTextureData.set(covariances);
-            } else {
+            } else if (!directResult) {
                 SplatMesh.updatePaddedCompressedCovariancesTextureData(covariances, covariancesTextureData, 0, 0, covariances.length);
             }
 
@@ -763,13 +1297,23 @@ export class SplatMesh extends THREE.Mesh {
         } else {
             // set up scale & rotations data texture
             const elementsPerSplat = 6;
-            const scaleRotationsTexSize = computeDataTextureSize(SCALES_ROTATIONS_ELEMENTS_PER_TEXEL, elementsPerSplat);
+            const scaleRotationsTexSize = getDataTextureSize(SCALES_ROTATIONS_ELEMENTS_PER_TEXEL, elementsPerSplat);
             let ScaleRotationsDataType = scaleRotationCompressionLevel >= 1 ? Uint16Array : Float32Array;
             let scaleRotationsTextureType = scaleRotationCompressionLevel >= 1 ? THREE.HalfFloatType : THREE.FloatType;
-            const paddedScaleRotations = new ScaleRotationsDataType(scaleRotationsTexSize.x * scaleRotationsTexSize.y *
-                                                                    SCALES_ROTATIONS_ELEMENTS_PER_TEXEL);
+            const scaleRotationsArrayLength = scaleRotationsTexSize.x * scaleRotationsTexSize.y *
+                SCALES_ROTATIONS_ELEMENTS_PER_TEXEL;
+            const directGpuScaleRotations = directResult?.gpuScaleRotations;
+            const useDirectPaddedScaleRotations = ScaleRotationsDataType === Float32Array &&
+                directGpuScaleRotations instanceof Float32Array && directGpuScaleRotations.length === scaleRotationsArrayLength;
+            const paddedScaleRotations = useDirectPaddedScaleRotations ? directGpuScaleRotations :
+                new ScaleRotationsDataType(scaleRotationsArrayLength);
+            recordGeneratedDataTexture('scaleRotations', paddedScaleRotations);
 
-            SplatMesh.updateScaleRotationsPaddedData(0, splatCount - 1, scales, rotations, paddedScaleRotations);
+            // Direct data is installed once by updateDataTexturesFromBaseData()
+            // immediately after texture setup. Avoid packing the same array here.
+            if (!directResult) {
+                SplatMesh.updateScaleRotationsPaddedData(0, splatCount - 1, scales, rotations, paddedScaleRotations);
+            }
 
             const scaleRotationsTex = new THREE.DataTexture(paddedScaleRotations, scaleRotationsTexSize.x, scaleRotationsTexSize.y,
                                                             THREE.RGBAFormat, scaleRotationsTextureType);
@@ -781,107 +1325,248 @@ export class SplatMesh extends THREE.Mesh {
                 'data': paddedScaleRotations,
                 'texture': scaleRotationsTex,
                 'size': scaleRotationsTexSize,
-                'compressionLevel': scaleRotationCompressionLevel
+                'compressionLevel': scaleRotationCompressionLevel,
+                'gpuScaleRotations': directResult?.gpuScaleRotations || null,
+                'directPadded': useDirectPaddedScaleRotations
             };
+            if (useDirectScaleRotationCovariance) {
+                this.material.uniforms.covariancesFromScaleRotation.value = 1;
+                // The inactive covariance samplers still need compatible WebGL
+                // textures on some drivers even though the shader branch ignores them.
+                const dummyCovarianceTexture = new THREE.DataTexture(new Float32Array(16), 2, 2,
+                                                                       THREE.RGBAFormat, THREE.FloatType);
+                dummyCovarianceTexture.needsUpdate = true;
+                const dummyHalfCovarianceTexture = new THREE.DataTexture(new Uint32Array(16), 2, 2,
+                                                                          THREE.RGBAIntegerFormat, THREE.UnsignedIntType);
+                dummyHalfCovarianceTexture.internalFormat = 'RGBA32UI';
+                dummyHalfCovarianceTexture.needsUpdate = true;
+                this.material.uniforms.covariancesTexture.value = dummyCovarianceTexture;
+                this.material.uniforms.covariancesTextureHalfFloat.value = dummyHalfCovarianceTexture;
+                this.splatDataTextures.covariancesDummy = { texture: dummyCovarianceTexture };
+                this.splatDataTextures.covariancesHalfDummy = { texture: dummyHalfCovarianceTexture };
+            }
         }
+        if (this.useCompressedTexture) {
+            const splatBuffer = this.scenes[0].splatBuffer;
+            let payload = splatBuffer.compressedTextureData || splatBuffer.astcData;
+            if (payload && !payload.format && splatBuffer.astcData === payload) {
+                payload = { ...payload, format: 'astc' };
+            }
+            if (!payload) throw new Error('SplatMesh is missing its compressed texture payload.');
+            {
+                const descriptor = validateCompressedTexturePayload(payload);
+                const { format, raw, width, height, layers, singleWidth, singleHeight, threeFormat } = descriptor;
+                const { shnMin, shnMax } = payload;
+                const uploadQueuedAt = performance.now();
+                console.log(
+                    `[Compressed Texture Upload] Format: ${format}, Width: ${width}, Height: ${height}, ` +
+                    `Layers: ${layers}, RawSize: ${raw.byteLength}`
+                );
 
-        if (shData) {
-            const shTextureType = shCompressionLevel === 2 ? THREE.UnsignedByteType : THREE.HalfFloatType;
+                const compressedTexture = new THREE.CompressedArrayTexture(
+                    [{ data: raw, width, height, depth: layers }],
+                    width,
+                    height,
+                    layers,
+                    threeFormat
+                );
+                compressedTexture.minFilter = THREE.LinearFilter;
+                compressedTexture.magFilter = THREE.LinearFilter;
 
-            let paddedSHComponentCount = shComponentCount;
-            if (paddedSHComponentCount % 2 !== 0) paddedSHComponentCount++;
-            const shElementsPerTexel = 4;
-            const texelFormat = shElementsPerTexel === 4 ? THREE.RGBAFormat : THREE.RGFormat;
-            let shTexSize = computeDataTextureSize(shElementsPerTexel, paddedSHComponentCount);
+                compressedTexture.wrapS = THREE.ClampToEdgeWrapping;
+                compressedTexture.wrapT = THREE.ClampToEdgeWrapping;
+                compressedTexture.needsUpdate = true;
 
-            // Use one texture for all spherical harmonics data
-            if (shTexSize.x * shTexSize.y <= MAX_TEXTURE_TEXELS) {
-                const paddedSHArraySize = shTexSize.x * shTexSize.y * shElementsPerTexel;
-                const paddedSHArray = new SphericalHarmonicsArrayType(paddedSHArraySize);
-                for (let c = 0; c < splatCount; c++) {
-                    const srcBase = shComponentCount * c;
-                    const destBase = paddedSHComponentCount * c;
-                    for (let i = 0; i < shComponentCount; i++) {
-                        paddedSHArray[destBase + i] = shData[srcBase + i];
+                this.material.uniforms.astcTextures.value = compressedTexture;
+                this.material.uniforms.astcSingleWidth.value = singleWidth;
+                this.material.uniforms.astcSingleHeight.value = singleHeight;
+                this.material.uniforms.astcTextureWidth.value = width;
+                this.splatDataTextures['compressedTexture'] = {
+                    'data': raw,
+                    'texture': compressedTexture,
+                    'size': new THREE.Vector3(width, height, layers),
+                    'format': format,
+                    'uploadQueuedAt': uploadQueuedAt,
+                    'byteLength': raw.byteLength
+                };
+
+                // Set the dequantization parameters (minimum and range).
+                const range = new THREE.Vector3(shnMax - shnMin, shnMax - shnMin, shnMax - shnMin);
+                const min = new THREE.Vector3(shnMin, shnMin, shnMin);
+                this.material.uniforms.astcQuantRange.value.copy(range);
+                this.material.uniforms.astcQuantMin.value.copy(min);
+                const quantMins = this.material.uniforms.astcQuantMins?.value;
+                const quantRanges = this.material.uniforms.astcQuantRanges?.value;
+                if (quantMins && quantRanges && payload.shnMins?.length >= 45 && payload.shnMaxs?.length >= 45) {
+                    for (let coefficient = 0; coefficient < 15; coefficient++) {
+                        const base = coefficient * 3;
+                        const minValue = new THREE.Vector3(payload.shnMins[base], payload.shnMins[base + 1], payload.shnMins[base + 2]);
+                        const maxValue = new THREE.Vector3(payload.shnMaxs[base], payload.shnMaxs[base + 1], payload.shnMaxs[base + 2]);
+                        quantMins[coefficient].copy(minValue);
+                        quantRanges[coefficient].copy(maxValue).sub(minValue);
+                    }
+                } else if (quantMins && quantRanges) {
+                    for (let coefficient = 0; coefficient < 15; coefficient++) {
+                        quantMins[coefficient].copy(min);
+                        quantRanges[coefficient].copy(range);
                     }
                 }
 
-                const shTexture = new THREE.DataTexture(paddedSHArray, shTexSize.x, shTexSize.y, texelFormat, shTextureType);
-                shTexture.needsUpdate = true;
-                this.material.uniforms.sphericalHarmonicsTexture.value = shTexture;
-                this.splatDataTextures['sphericalHarmonics'] = {
-                    'componentCount': shComponentCount,
-                    'paddedComponentCount': paddedSHComponentCount,
-                    'data': paddedSHArray,
-                    'textureCount': 1,
-                    'texture': shTexture,
-                    'size': shTexSize,
-                    'compressionLevel': shCompressionLevel,
-                    'elementsPerTexel': shElementsPerTexel
-                };
-            // Use three textures for spherical harmonics data, one per color channel
-            } else {
-                const shComponentCountPerChannel = shComponentCount / 3;
-                paddedSHComponentCount = shComponentCountPerChannel;
-                if (paddedSHComponentCount % 2 !== 0) paddedSHComponentCount++;
-                shTexSize = computeDataTextureSize(shElementsPerTexel, paddedSHComponentCount);
+                // 4. Create the UV lookup texture (RG32UI).
+                const shElementsPerTexel = 4; // Four RGBA channels.
 
-                const paddedSHArraySize = shTexSize.x * shTexSize.y * shElementsPerTexel;
-                const textureUniforms = [this.material.uniforms.sphericalHarmonicsTextureR,
-                                         this.material.uniforms.sphericalHarmonicsTextureG,
-                                         this.material.uniforms.sphericalHarmonicsTextureB];
-                const paddedSHArrays = [];
-                const shTextures = [];
-                for (let t = 0; t < 3; t++) {
+                // This must be 4 because each splat occupies one complete RGBA texel.
+                // Even though U and V use only R and G, a stride of 4 prevents allocating a half-sized texture.
+                const paddedSHComponentCount = 4;
+
+                let uvTexSize = getDataTextureSize(shElementsPerTexel, paddedSHComponentCount);
+
+                const uvArrayLength = uvTexSize.x * uvTexSize.y * 4;
+                const directGpuCompressedTextureUV = directResult?.gpuCompressedTextureUV;
+                const useDirectPaddedCompressedTextureUV = directGpuCompressedTextureUV instanceof Uint32Array &&
+                    directGpuCompressedTextureUV.length === uvArrayLength;
+                const paddedUVArray = useDirectPaddedCompressedTextureUV ? directGpuCompressedTextureUV :
+                    new Uint32Array(uvArrayLength);
+                recordGeneratedDataTexture('compressedTextureUV', paddedUVArray);
+
+                const astcUVTexture = new THREE.DataTexture(
+                    paddedUVArray, uvTexSize.x, uvTexSize.y, THREE.RGBAIntegerFormat, THREE.UnsignedIntType
+                );
+                astcUVTexture.internalFormat = 'RGBA32UI';
+
+                astcUVTexture.minFilter = THREE.NearestFilter;
+                astcUVTexture.magFilter = THREE.NearestFilter;
+
+                astcUVTexture.needsUpdate = true;
+
+                this.material.uniforms.astcUVTexture.value = astcUVTexture;
+                this.material.uniforms.astcUVTextureSize.value.copy(uvTexSize);
+
+                this.splatDataTextures['compressedTextureUV'] = {
+                    'data': paddedUVArray,
+                    'texture': astcUVTexture,
+                    'size': uvTexSize,
+                    'elementsPerTexel': 4,
+                    'gpuCompressedTextureUV': directResult?.gpuCompressedTextureUV || null,
+                    'directPadded': useDirectPaddedCompressedTextureUV
+                };
+
+                this.splatDataTextures['sphericalHarmonics'] = null;
+            }
+        } else {
+            if (shData) {
+                const shTextureType = shCompressionLevel === 2 ? THREE.UnsignedByteType : THREE.HalfFloatType;
+
+                let paddedSHComponentCount = shComponentCount;
+                if (paddedSHComponentCount % 2 !== 0) paddedSHComponentCount++;
+                const shElementsPerTexel = 4;
+                const texelFormat = shElementsPerTexel === 4 ? THREE.RGBAFormat : THREE.RGFormat;
+                let shTexSize = SplatMesh.computeDataTextureSize(shElementsPerTexel, paddedSHComponentCount,
+                                                                maxSplatCount, previewBuild, true);
+
+                // Use one texture for all spherical harmonics data
+                if (shTexSize.x * shTexSize.y <= MAX_TEXTURE_TEXELS) {
+                    const paddedSHArraySize = shTexSize.x * shTexSize.y * shElementsPerTexel;
                     const paddedSHArray = new SphericalHarmonicsArrayType(paddedSHArraySize);
-                    paddedSHArrays.push(paddedSHArray);
+                    recordGeneratedDataTexture('sphericalHarmonics', paddedSHArray);
                     for (let c = 0; c < splatCount; c++) {
                         const srcBase = shComponentCount * c;
                         const destBase = paddedSHComponentCount * c;
-                        if (shComponentCountPerChannel >= 3) {
-                            for (let i = 0; i < 3; i++) paddedSHArray[destBase + i] = shData[srcBase + t * 3 + i];
-                            if (shComponentCountPerChannel >= 8) {
-                                for (let i = 0; i < 5; i++) paddedSHArray[destBase + 3 + i] = shData[srcBase + 9 + t * 5 + i];
-                            }
+                        for (let i = 0; i < shComponentCount; i++) {
+                            paddedSHArray[destBase + i] = shData[srcBase + i];
                         }
                     }
 
                     const shTexture = new THREE.DataTexture(paddedSHArray, shTexSize.x, shTexSize.y, texelFormat, shTextureType);
-                    shTextures.push(shTexture);
                     shTexture.needsUpdate = true;
-                    textureUniforms[t].value = shTexture;
+                    this.material.uniforms.sphericalHarmonicsTexture.value = shTexture;
+                    this.splatDataTextures['sphericalHarmonics'] = {
+                        'componentCount': shComponentCount,
+                        'paddedComponentCount': paddedSHComponentCount,
+                        'data': paddedSHArray,
+                        'textureCount': 1,
+                        'texture': shTexture,
+                        'size': shTexSize,
+                        'compressionLevel': shCompressionLevel,
+                        'elementsPerTexel': shElementsPerTexel
+                    };
+                // Use three textures for spherical harmonics data, one per color channel
+                } else {
+                    const shComponentCountPerChannel = shComponentCount / 3;
+                    paddedSHComponentCount = shComponentCountPerChannel;
+                    if (paddedSHComponentCount % 2 !== 0) paddedSHComponentCount++;
+                    shTexSize = getDataTextureSize(shElementsPerTexel, paddedSHComponentCount);
+
+                    const paddedSHArraySize = shTexSize.x * shTexSize.y * shElementsPerTexel;
+                    const textureUniforms = [this.material.uniforms.sphericalHarmonicsTextureR,
+                                             this.material.uniforms.sphericalHarmonicsTextureG,
+                                             this.material.uniforms.sphericalHarmonicsTextureB];
+                    const paddedSHArrays = [];
+                    const shTextures = [];
+                    for (let t = 0; t < 3; t++) {
+                        const paddedSHArray = new SphericalHarmonicsArrayType(paddedSHArraySize);
+                        recordGeneratedDataTexture('sphericalHarmonics', paddedSHArray);
+                        paddedSHArrays.push(paddedSHArray);
+                        for (let c = 0; c < splatCount; c++) {
+                            const srcBase = shComponentCount * c;
+                            const destBase = paddedSHComponentCount * c;
+                            if (shComponentCountPerChannel >= 3) {
+                                for (let i = 0; i < 3; i++) paddedSHArray[destBase + i] = shData[srcBase + t * 3 + i];
+                                if (shComponentCountPerChannel >= 8) {
+                                    for (let i = 0; i < 5; i++) paddedSHArray[destBase + 3 + i] = shData[srcBase + 9 + t * 5 + i];
+                                    if (shComponentCountPerChannel >= 15) {
+                                        for (let i = 0; i < 7; i++) paddedSHArray[destBase + 8 + i] = shData[srcBase + 24 + t * 7 + i];
+                                    }
+                                }
+                            }
+                        }
+
+                        const shTexture = new THREE.DataTexture(paddedSHArray, shTexSize.x, shTexSize.y, texelFormat, shTextureType);
+                        shTextures.push(shTexture);
+                        shTexture.needsUpdate = true;
+                        textureUniforms[t].value = shTexture;
+                    }
+
+                    this.material.uniforms.sphericalHarmonicsMultiTextureMode.value = 1;
+                    this.splatDataTextures['sphericalHarmonics'] = {
+                        'componentCount': shComponentCount,
+                        'componentCountPerChannel': shComponentCountPerChannel,
+                        'paddedComponentCount': paddedSHComponentCount,
+                        'data': paddedSHArrays,
+                        'textureCount': 3,
+                        'textures': shTextures,
+                        'size': shTexSize,
+                        'compressionLevel': shCompressionLevel,
+                        'elementsPerTexel': shElementsPerTexel
+                    };
                 }
 
-                this.material.uniforms.sphericalHarmonicsMultiTextureMode.value = 1;
-                this.splatDataTextures['sphericalHarmonics'] = {
-                    'componentCount': shComponentCount,
-                    'componentCountPerChannel': shComponentCountPerChannel,
-                    'paddedComponentCount': paddedSHComponentCount,
-                    'data': paddedSHArrays,
-                    'textureCount': 3,
-                    'textures': shTextures,
-                    'size': shTexSize,
-                    'compressionLevel': shCompressionLevel,
-                    'elementsPerTexel': shElementsPerTexel
-                };
+                this.material.uniforms.sphericalHarmonicsTextureSize.value.copy(shTexSize);
+                this.material.uniforms.sphericalHarmonics8BitMode.value = shCompressionLevel === 2 ? 1 : 0;
+                for (let s = 0; s < this.scenes.length; s++) {
+                    const splatBuffer = this.scenes[s].splatBuffer;
+                    this.material.uniforms.sphericalHarmonics8BitCompressionRangeMin.value[s] =
+                        splatBuffer.minSphericalHarmonicsCoeff;
+                    this.material.uniforms.sphericalHarmonics8BitCompressionRangeMax.value[s] =
+                        splatBuffer.maxSphericalHarmonicsCoeff;
+                }
+                this.material.uniformsNeedUpdate = true;
             }
-
-            this.material.uniforms.sphericalHarmonicsTextureSize.value.copy(shTexSize);
-            this.material.uniforms.sphericalHarmonics8BitMode.value = shCompressionLevel === 2 ? 1 : 0;
-            for (let s = 0; s < this.scenes.length; s++) {
-                const splatBuffer = this.scenes[s].splatBuffer;
-                this.material.uniforms.sphericalHarmonics8BitCompressionRangeMin.value[s] =
-                    splatBuffer.minSphericalHarmonicsCoeff;
-                this.material.uniforms.sphericalHarmonics8BitCompressionRangeMax.value[s] =
-                    splatBuffer.maxSphericalHarmonicsCoeff;
-            }
-            this.material.uniformsNeedUpdate = true;
         }
 
-        const sceneIndexesTexSize = computeDataTextureSize(SCENE_INDEXES_ELEMENTS_PER_TEXEL, 4);
+
+        // A one-scene build always resolves sceneIndex to zero in the shader,
+        // so bind one valid R32UI texel instead of uploading a redundant
+        // million-entry zero texture. A later multi-scene build recreates the
+        // full texture from its explicit index map.
+        const sceneIndexesTexSize = this.implicitSingleSceneIndexMap ?
+            new THREE.Vector2(1, 1) : getDataTextureSize(SCENE_INDEXES_ELEMENTS_PER_TEXEL, 1);
         const paddedTransformIndexes = new Uint32Array(sceneIndexesTexSize.x *
                                                        sceneIndexesTexSize.y * SCENE_INDEXES_ELEMENTS_PER_TEXEL);
-        for (let c = 0; c < splatCount; c++) paddedTransformIndexes[c] = this.globalSplatIndexToSceneIndexMap[c];
+        recordGeneratedDataTexture('sceneIndexes', paddedTransformIndexes);
+        if (!this.implicitSingleSceneIndexMap) {
+            for (let c = 0; c < splatCount; c++) paddedTransformIndexes[c] = this.globalSplatIndexToSceneIndexMap[c];
+        }
         const sceneIndexesTexture = new THREE.DataTexture(paddedTransformIndexes, sceneIndexesTexSize.x, sceneIndexesTexSize.y,
                                                           THREE.RedIntegerFormat, THREE.UnsignedIntType);
         sceneIndexesTexture.internalFormat = 'R32UI';
@@ -895,9 +1580,45 @@ export class SplatMesh extends THREE.Mesh {
             'size': sceneIndexesTexSize
         };
         this.material.uniforms.sceneCount.value = this.scenes.length;
+
+        this.generatedDataTextureBytes = generatedDataTextureBytes;
+        if (processingProfile) {
+            processingProfile.generatedDataTextureBytes = Object.values(generatedDataTextureBytes)
+                .reduce((total, bytes) => total + bytes, 0);
+            processingProfile.generatedDataTextureByteBreakdown = { ...generatedDataTextureBytes };
+        }
     }
 
-    updateBaseDataFromSplatBuffers(fromSplat, toSplat) {
+    updateBaseDataFromSplatBuffers(fromSplat, toSplat, processingProfile = null) {
+        console.log(`[updateBaseDataFromSplatBuffers] srcFrome:${fromSplat}, srcEnd:${toSplat}`);
+        const updateBaseDataStartTime = performance.now();
+        const directResult = this._uwaGpuDataDirect;
+        if (directResult && this.scenes.length === 1) {
+            const baseData = this.splatDataTextures.baseData;
+            baseData.centers = directResult.positions;
+            baseData.colors = directResult.colors;
+            if (baseData.covariances && directResult.covariances) baseData.covariances = directResult.covariances;
+            if (baseData.scales && directResult.scales) baseData.scales = directResult.scales;
+            if (baseData.rotations && directResult.rotations) baseData.rotations = directResult.rotations;
+            if (directResult.compressedTextureData?.uvs) {
+                baseData.compressedTextureUVs = directResult.compressedTextureData.uvs;
+            }
+
+            // ASTC/BC direct postprocess results intentionally omit CPU covariance
+            // arrays. Populate the covariance texture source from their scale and
+            // quaternion arrays before the texture upload phase. The explicit
+            // scale/rotation fallback leaves this path disabled and keeps its
+            // existing online shader route intact.
+            if (baseData.covariances && !this.useDirectScaleRotationCovariance && this.useCompressedTexture) {
+                const covarianceTextureDesc = this.splatDataTextures.covariances;
+                const covarianceCompressionLevel = covarianceTextureDesc?.compressionLevel ?? 0;
+                this.fillDirectCompressedTextureDataArrays(
+                    fromSplat, toSplat, covarianceCompressionLevel, 0
+                );
+            }
+            recordProcessingDuration(processingProfile, 'meshUpdateBaseDataMs', updateBaseDataStartTime);
+            return;
+        }
         const covarancesTextureDesc = this.splatDataTextures['covariances'];
         const covarianceCompressionLevel = covarancesTextureDesc ? covarancesTextureDesc.compressionLevel : undefined;
         const scaleRotationsTextureDesc = this.splatDataTextures['scaleRotations'];
@@ -905,14 +1626,65 @@ export class SplatMesh extends THREE.Mesh {
         const shITextureDesc = this.splatDataTextures['sphericalHarmonics'];
         const shCompressionLevel = shITextureDesc ? shITextureDesc.compressionLevel : 0;
 
-        this.fillSplatDataArrays(this.splatDataTextures.baseData.covariances, this.splatDataTextures.baseData.scales,
-                                 this.splatDataTextures.baseData.rotations, this.splatDataTextures.baseData.centers,
-                                 this.splatDataTextures.baseData.colors, this.splatDataTextures.baseData.sphericalHarmonics, undefined,
-                                 covarianceCompressionLevel, scaleRotationCompressionLevel, shCompressionLevel,
-                                 fromSplat, toSplat, fromSplat);
+        // Select the SH data destination.
+        // In ASTC mode, fillSplatDataArrays must not process SH, so use null.
+        // Otherwise, preserve the existing path and target the sphericalHarmonics array.
+        let shDataTarget = this.useCompressedTexture ? null : this.splatDataTextures.baseData.sphericalHarmonics;
+
+        // In ASTC mode, ensure baseData has storage for UV coordinates.
+        if (this.useCompressedTexture) {
+            if (!this.splatDataTextures.baseData.compressedTextureUVs) {
+                const maxSplatCount = this.getMaxSplatCount();
+                this.splatDataTextures.baseData.compressedTextureUVs = new Uint32Array(maxSplatCount * 2);
+            }
+        }
+
+        const directStartTime = performance.now();
+        const directCompressedTextureUsed = this.useCompressedTexture && this.fillDirectCompressedTextureDataArrays(
+            fromSplat, toSplat, covarianceCompressionLevel, scaleRotationCompressionLevel
+        );
+        if (directCompressedTextureUsed) {
+            recordProcessingDuration(processingProfile, 'meshDirectCompressedTextureDataMs', directStartTime);
+            recordProcessingDuration(processingProfile, 'meshUpdateBaseDataMs', updateBaseDataStartTime);
+            return;
+        }
+
+        // Invoke the common fill function.
+        // The sixth argument is now shDataTarget, which may be null.
+        const fillBaseDataStartTime = performance.now();
+        this.fillSplatDataArrays(
+            this.splatDataTextures.baseData.covariances,
+            this.splatDataTextures.baseData.scales,
+            this.splatDataTextures.baseData.rotations,
+            this.splatDataTextures.baseData.centers,
+            this.splatDataTextures.baseData.colors,
+            shDataTarget, // Pass null in ASTC mode.
+            undefined,
+            covarianceCompressionLevel,
+            scaleRotationCompressionLevel,
+            shCompressionLevel,
+            fromSplat,
+            toSplat,
+            fromSplat
+        );
+        recordProcessingDuration(processingProfile, 'meshFillBaseArraysMs', fillBaseDataStartTime);
+
+        // Extract UV data explicitly in ASTC mode.
+        if (this.useCompressedTexture) {
+            const fillAstcUvStartTime = performance.now();
+            this.fillSplatCompressedTextureUVs(
+                this.splatDataTextures.baseData.compressedTextureUVs,
+                fromSplat,
+                toSplat,
+                fromSplat
+            );
+            recordProcessingDuration(processingProfile, 'meshFillAstcUvsMs', fillAstcUvStartTime);
+        }
+        recordProcessingDuration(processingProfile, 'meshUpdateBaseDataMs', updateBaseDataStartTime);
     }
 
-    updateDataTexturesFromBaseData(fromSplat, toSplat) {
+    updateDataTexturesFromBaseData(fromSplat, toSplat, processingProfile = null) {
+        const updateTexturesStartTime = performance.now();
         const covarancesTextureDesc = this.splatDataTextures['covariances'];
         const covarianceCompressionLevel = covarancesTextureDesc ? covarancesTextureDesc.compressionLevel : undefined;
         const scaleRotationsTextureDesc = this.splatDataTextures['scaleRotations'];
@@ -921,11 +1693,26 @@ export class SplatMesh extends THREE.Mesh {
         const shCompressionLevel = shTextureDesc ? shTextureDesc.compressionLevel : 0;
 
         // Update center & color data texture
+        const centerColorsTextureStartTime = performance.now();
         const centerColorsTextureDescriptor = this.splatDataTextures['centerColors'];
         const paddedCenterColors = centerColorsTextureDescriptor.data;
         const centerColorsTexture = centerColorsTextureDescriptor.texture;
-        SplatMesh.updateCenterColorsPaddedData(fromSplat, toSplat, this.splatDataTextures.baseData.centers,
-                                               this.splatDataTextures.baseData.colors, paddedCenterColors);
+        const splatCount = this.getSplatCount(true);
+        const directGpuCenterColors = centerColorsTextureDescriptor.gpuCenterColors;
+        const directCenterColorsIsFullRange = fromSplat === 0 && toSplat === splatCount - 1;
+        const useDirectPaddedCenterColors = directCenterColorsIsFullRange &&
+            centerColorsTextureDescriptor.directPadded && directGpuCenterColors === paddedCenterColors;
+        const useDirectCompactCenterColors = directCenterColorsIsFullRange &&
+            !useDirectPaddedCenterColors && directGpuCenterColors instanceof Uint32Array &&
+            directGpuCenterColors.length === splatCount * 4;
+        if (useDirectPaddedCenterColors) {
+            // The worker array is already the complete texture backing store.
+        } else if (useDirectCompactCenterColors) {
+            paddedCenterColors.set(directGpuCenterColors.subarray(0, splatCount * 4), 0);
+        } else {
+            SplatMesh.updateCenterColorsPaddedData(fromSplat, toSplat, this.splatDataTextures.baseData.centers,
+                                                   this.splatDataTextures.baseData.colors, paddedCenterColors);
+        }
         const centerColorsTextureProps = this.renderer ? this.renderer.properties.get(centerColorsTexture) : null;
         if (!centerColorsTextureProps || !centerColorsTextureProps.__webglTexture) {
             centerColorsTexture.needsUpdate = true;
@@ -934,18 +1721,20 @@ export class SplatMesh extends THREE.Mesh {
                                    centerColorsTextureProps, CENTER_COLORS_ELEMENTS_PER_TEXEL, CENTER_COLORS_ELEMENTS_PER_SPLAT, 4,
                                    fromSplat, toSplat);
         }
+        recordProcessingDuration(processingProfile, 'meshUpdateCenterColorsTextureMs', centerColorsTextureStartTime);
 
         // update covariance data texture
         if (covarancesTextureDesc) {
+            const covariancesTextureStartTime = performance.now();
             const covariancesTexture = covarancesTextureDesc.texture;
             const covarancesStartElement = fromSplat * COVARIANCES_ELEMENTS_PER_SPLAT;
             const covariancesEndElement = toSplat * COVARIANCES_ELEMENTS_PER_SPLAT;
 
             if (covarianceCompressionLevel === 0) {
-                for (let i = covarancesStartElement; i <= covariancesEndElement; i++) {
-                    const covariance = this.splatDataTextures.baseData.covariances[i];
-                    covarancesTextureDesc.data[i] = covariance;
-                }
+                covarancesTextureDesc.data.set(
+                    this.splatDataTextures.baseData.covariances.subarray(covarancesStartElement, covariancesEndElement + 1),
+                    covarancesStartElement
+                );
             } else {
                 SplatMesh.updatePaddedCompressedCovariancesTextureData(this.splatDataTextures.baseData.covariances,
                                                                        covarancesTextureDesc.data,
@@ -967,17 +1756,43 @@ export class SplatMesh extends THREE.Mesh {
                                            covarancesTextureDesc.elementsPerTexelAllocated, 2, fromSplat, toSplat);
                 }
             }
+            recordProcessingDuration(processingProfile, 'meshUpdateCovariancesTextureMs', covariancesTextureStartTime);
         }
 
         // update scale and rotation data texture
         if (scaleRotationsTextureDesc) {
+            const scaleRotationsTextureStartTime = performance.now();
             const paddedScaleRotations = scaleRotationsTextureDesc.data;
             const scaleRotationsTexture = scaleRotationsTextureDesc.texture;
             const elementsPerSplat = 6;
             const bytesPerElement = scaleRotationCompressionLevel === 0 ? 4 : 2;
 
-            SplatMesh.updateScaleRotationsPaddedData(fromSplat, toSplat, this.splatDataTextures.baseData.scales,
-                                                     this.splatDataTextures.baseData.rotations, paddedScaleRotations);
+            if (this._uwaGpuRotationsAreWxyz) {
+                const packedScaleRotations = scaleRotationsTextureDesc.gpuScaleRotations;
+                const directScaleIsFullRange = fromSplat === 0 && toSplat === this.getSplatCount(true) - 1;
+                const useDirectPaddedScaleRotations = directScaleIsFullRange && scaleRotationsTextureDesc.directPadded &&
+                    packedScaleRotations === paddedScaleRotations;
+                const useDirectCompactScaleRotations = directScaleIsFullRange && !useDirectPaddedScaleRotations &&
+                    packedScaleRotations instanceof Float32Array &&
+                    packedScaleRotations.length === this.getSplatCount(true) * elementsPerSplat;
+                if (useDirectPaddedScaleRotations) {
+                    // The worker array is already the complete texture backing store.
+                } else if (useDirectCompactScaleRotations) {
+                    const start = fromSplat * elementsPerSplat;
+                    const end = (toSplat + 1) * elementsPerSplat;
+                    paddedScaleRotations.set(packedScaleRotations.subarray(start, end), start);
+                } else {
+                    SplatMesh.updateDirectScaleRotationsPaddedData(fromSplat, toSplat,
+                                                                   this.splatDataTextures.baseData.scales,
+                                                                   this.splatDataTextures.baseData.rotations,
+                                                                   paddedScaleRotations);
+                }
+            } else {
+                SplatMesh.updateScaleRotationsPaddedData(fromSplat, toSplat,
+                                                         this.splatDataTextures.baseData.scales,
+                                                         this.splatDataTextures.baseData.rotations,
+                                                         paddedScaleRotations);
+            }
             const scaleRotationsTextureProps = this.renderer ? this.renderer.properties.get(scaleRotationsTexture) : null;
             if (!scaleRotationsTextureProps || !scaleRotationsTextureProps.__webglTexture) {
                 scaleRotationsTexture.needsUpdate = true;
@@ -986,75 +1801,134 @@ export class SplatMesh extends THREE.Mesh {
                                        scaleRotationsTextureProps, SCALES_ROTATIONS_ELEMENTS_PER_TEXEL, elementsPerSplat, bytesPerElement,
                                        fromSplat, toSplat);
             }
+            recordProcessingDuration(processingProfile, 'meshUpdateScaleRotationsTextureMs', scaleRotationsTextureStartTime);
         }
 
-        // update spherical harmonics data texture
-        const shData = this.splatDataTextures.baseData.sphericalHarmonics;
-        if (shData) {
-            let shBytesPerElement = 4;
-            if (shCompressionLevel === 1) shBytesPerElement = 2;
-            else if (shCompressionLevel === 2) shBytesPerElement = 1;
+        if (this.useCompressedTexture) {
+            const uvTexDesc = this.splatDataTextures['compressedTextureUV'];
+            if (uvTexDesc) {
+                const astcUvTextureStartTime = performance.now();
+                const paddedUVArray = uvTexDesc.data; // RGBA array created by setupDataTextures.
+                const sourceUVs = this.splatDataTextures.baseData.compressedTextureUVs;
 
-            const updateTexture = (shTexture, shTextureSize, elementsPerTexel, paddedSHArray, paddedSHComponentCount) => {
-                const shTextureProps = this.renderer ? this.renderer.properties.get(shTexture) : null;
-                if (!shTextureProps || !shTextureProps.__webglTexture) {
-                    shTexture.needsUpdate = true;
+                // Expand compact U,V pairs into the padded four-element RGBA array.
+                // The WebGL texture upload requires this alignment.
+                const directGpuCompressedTextureUV = uvTexDesc.gpuCompressedTextureUV;
+                const directUvIsFullRange = fromSplat === 0 && toSplat === splatCount - 1;
+                const useDirectPaddedCompressedTextureUV = directUvIsFullRange && uvTexDesc.directPadded &&
+                    directGpuCompressedTextureUV === paddedUVArray;
+                const useDirectCompactCompressedTextureUV = directUvIsFullRange &&
+                    !useDirectPaddedCompressedTextureUV && directGpuCompressedTextureUV instanceof Uint32Array &&
+                    directGpuCompressedTextureUV.length === splatCount * 4;
+                if (useDirectPaddedCompressedTextureUV) {
+                    // The worker array is already the complete texture backing store.
+                } else if (useDirectCompactCompressedTextureUV) {
+                    paddedUVArray.set(directGpuCompressedTextureUV.subarray(0, splatCount * 4), 0);
                 } else {
-                    this.updateDataTexture(paddedSHArray, shTexture, shTextureSize, shTextureProps, elementsPerTexel,
-                                           paddedSHComponentCount, shBytesPerElement, fromSplat, toSplat);
-                }
-            };
-
-            const shComponentCount = shTextureDesc.componentCount;
-            const paddedSHComponentCount = shTextureDesc.paddedComponentCount;
-
-            // Update for the case of a single texture for all spherical harmonics data
-            if (shTextureDesc.textureCount === 1) {
-                const paddedSHArray = shTextureDesc.data;
-                for (let c = fromSplat; c <= toSplat; c++) {
-                    const srcBase = shComponentCount * c;
-                    const destBase = paddedSHComponentCount * c;
-                    for (let i = 0; i < shComponentCount; i++) {
-                        paddedSHArray[destBase + i] = shData[srcBase + i];
+                    for (let c = fromSplat; c <= toSplat; c++) {
+                        const srcIdx = c * 2;
+                        const destIdx = c * 4; // Texture is RGBA32UI
+                        paddedUVArray[destIdx] = sourceUVs[srcIdx]; // R = U
+                        paddedUVArray[destIdx + 1] = sourceUVs[srcIdx + 1]; // G = V
+                        paddedUVArray[destIdx + 2] = 0;
+                        paddedUVArray[destIdx + 3] = 0;
                     }
                 }
-                updateTexture(shTextureDesc.texture, shTextureDesc.size,
-                              shTextureDesc.elementsPerTexel, paddedSHArray, paddedSHComponentCount);
-            // Update for the case of spherical harmonics data split among three textures, one for each color channel
-            } else {
-                const shComponentCountPerChannel = shTextureDesc.componentCountPerChannel;
-                for (let t = 0; t < 3; t++) {
-                    const paddedSHArray = shTextureDesc.data[t];
+
+                const uvTexture = uvTexDesc.texture;
+                const uvTextureProps = this.renderer ? this.renderer.properties.get(uvTexture) : null;
+
+                if (!uvTextureProps || !uvTextureProps.__webglTexture) {
+                    uvTexture.needsUpdate = true;
+                } else {
+                    // Reuse updateDataTexture.
+                    this.updateDataTexture(paddedUVArray, uvTexture, uvTexDesc.size,
+                        uvTextureProps, uvTexDesc.elementsPerTexel, // 4
+                        4, // elementsPerSplat (RGBA)
+                        4, // bytesPerElement (Uint32 = 4 bytes)
+                        fromSplat, toSplat);
+                }
+                recordProcessingDuration(processingProfile, 'meshUpdateAstcUvTextureMs', astcUvTextureStartTime);
+            }
+        } else {
+            // update spherical harmonics data texture
+            const shData = this.splatDataTextures.baseData.sphericalHarmonics;
+            if (shData) {
+                const sphericalHarmonicsTextureStartTime = performance.now();
+                let shBytesPerElement = 4;
+                if (shCompressionLevel === 1) shBytesPerElement = 2;
+                else if (shCompressionLevel === 2) shBytesPerElement = 1;
+
+                const updateTexture = (shTexture, shTextureSize, elementsPerTexel, paddedSHArray, paddedSHComponentCount) => {
+                    const shTextureProps = this.renderer ? this.renderer.properties.get(shTexture) : null;
+                    if (!shTextureProps || !shTextureProps.__webglTexture) {
+                        shTexture.needsUpdate = true;
+                    } else {
+                        this.updateDataTexture(paddedSHArray, shTexture, shTextureSize, shTextureProps, elementsPerTexel,
+                            paddedSHComponentCount, shBytesPerElement, fromSplat, toSplat);
+                    }
+                };
+
+                const shComponentCount = shTextureDesc.componentCount;
+                const paddedSHComponentCount = shTextureDesc.paddedComponentCount;
+
+                // Update for the case of a single texture for all spherical harmonics data
+                if (shTextureDesc.textureCount === 1) {
+                    const paddedSHArray = shTextureDesc.data;
                     for (let c = fromSplat; c <= toSplat; c++) {
                         const srcBase = shComponentCount * c;
                         const destBase = paddedSHComponentCount * c;
-                        if (shComponentCountPerChannel >= 3) {
-                            for (let i = 0; i < 3; i++) paddedSHArray[destBase + i] = shData[srcBase + t * 3 + i];
-                            if (shComponentCountPerChannel >= 8) {
-                                for (let i = 0; i < 5; i++) paddedSHArray[destBase + 3 + i] = shData[srcBase + 9 + t * 5 + i];
-                            }
+                        for (let i = 0; i < shComponentCount; i++) {
+                            paddedSHArray[destBase + i] = shData[srcBase + i];
                         }
                     }
-                    updateTexture(shTextureDesc.textures[t], shTextureDesc.size,
-                                  shTextureDesc.elementsPerTexel, paddedSHArray, paddedSHComponentCount);
+                    updateTexture(shTextureDesc.texture, shTextureDesc.size,
+                        shTextureDesc.elementsPerTexel, paddedSHArray, paddedSHComponentCount);
+                    // Update for the case of spherical harmonics data split among three textures, one for each color channel
+                } else {
+                    const shComponentCountPerChannel = shTextureDesc.componentCountPerChannel;
+                    for (let t = 0; t < 3; t++) {
+                        const paddedSHArray = shTextureDesc.data[t];
+                        for (let c = fromSplat; c <= toSplat; c++) {
+                            const srcBase = shComponentCount * c;
+                            const destBase = paddedSHComponentCount * c;
+                            if (shComponentCountPerChannel >= 3) {
+                                for (let i = 0; i < 3; i++) paddedSHArray[destBase + i] = shData[srcBase + t * 3 + i];
+                                if (shComponentCountPerChannel >= 8) {
+                                    for (let i = 0; i < 5; i++) paddedSHArray[destBase + 3 + i] = shData[srcBase + 9 + t * 5 + i];
+                                    if (shComponentCountPerChannel >= 15) {
+                                        for (let i = 0; i < 7; i++) paddedSHArray[destBase + 8 + i] = shData[srcBase + 24 + t * 7 + i];
+                                    }
+                                }
+                            }
+                        }
+                        updateTexture(shTextureDesc.textures[t], shTextureDesc.size,
+                            shTextureDesc.elementsPerTexel, paddedSHArray, paddedSHComponentCount);
+                    }
                 }
+                recordProcessingDuration(processingProfile, 'meshUpdateSphericalHarmonicsTextureMs', sphericalHarmonicsTextureStartTime);
             }
         }
 
         // update scene index & transform data
+        const sceneIndexesTextureStartTime = performance.now();
         const sceneIndexesTexDesc = this.splatDataTextures['sceneIndexes'];
-        const paddedSceneIndexes = sceneIndexesTexDesc.data;
-        for (let c = this.lastBuildSplatCount; c <= toSplat; c++) {
-            paddedSceneIndexes[c] = this.globalSplatIndexToSceneIndexMap[c];
+        if (!this.implicitSingleSceneIndexMap) {
+            const paddedSceneIndexes = sceneIndexesTexDesc.data;
+            for (let c = this.lastBuildSplatCount; c <= toSplat; c++) {
+                paddedSceneIndexes[c] = this.globalSplatIndexToSceneIndexMap[c];
+            }
+            const sceneIndexesTexture = sceneIndexesTexDesc.texture;
+            const sceneIndexesTextureProps = this.renderer ? this.renderer.properties.get(sceneIndexesTexture) : null;
+            if (!sceneIndexesTextureProps || !sceneIndexesTextureProps.__webglTexture) {
+                sceneIndexesTexture.needsUpdate = true;
+            } else {
+                this.updateDataTexture(paddedSceneIndexes, sceneIndexesTexDesc.texture, sceneIndexesTexDesc.size,
+                                       sceneIndexesTextureProps, 1, 1, 1, this.lastBuildSplatCount, toSplat);
+            }
         }
-        const sceneIndexesTexture = sceneIndexesTexDesc.texture;
-        const sceneIndexesTextureProps = this.renderer ? this.renderer.properties.get(sceneIndexesTexture) : null;
-        if (!sceneIndexesTextureProps || !sceneIndexesTextureProps.__webglTexture) {
-            sceneIndexesTexture.needsUpdate = true;
-        } else {
-            this.updateDataTexture(paddedSceneIndexes, sceneIndexesTexDesc.texture, sceneIndexesTexDesc.size,
-                                   sceneIndexesTextureProps, 1, 1, 1, this.lastBuildSplatCount, toSplat);
-        }
+        recordProcessingDuration(processingProfile, 'meshUpdateSceneIndexesTextureMs', sceneIndexesTextureStartTime);
+        recordProcessingDuration(processingProfile, 'meshUpdateDataTexturesMs', updateTexturesStartTime);
     }
 
     getTargetCovarianceCompressionLevel() {
@@ -1169,7 +2043,44 @@ export class SplatMesh extends THREE.Mesh {
         }
     }
 
-    updateVisibleRegion(sinceLastBuildOnly) {
+    // UWA reconstruction stores quaternions as w,x,y,z. The regular SplatBuffer
+    // path stores x,y,z,w in its scale/rotation texture, so convert the direct
+    // result explicitly while keeping the compact result layout unchanged.
+    static updateDirectScaleRotationsPaddedData(from, to, scales, rotations, paddedScaleRotations) {
+        for (let c = from; c <= to; c++) {
+            const scaleBase = c * 3;
+            const rotationBase = c * 4;
+            const textureBase = c * 6;
+            paddedScaleRotations[textureBase] = scales[scaleBase];
+            paddedScaleRotations[textureBase + 1] = scales[scaleBase + 1];
+            paddedScaleRotations[textureBase + 2] = scales[scaleBase + 2];
+            paddedScaleRotations[textureBase + 3] = rotations[rotationBase + 1];
+            paddedScaleRotations[textureBase + 4] = rotations[rotationBase + 2];
+            paddedScaleRotations[textureBase + 5] = rotations[rotationBase + 3];
+        }
+    }
+
+    prepareVisibleRegionForImmediateRender() {
+        if (this.scenes.length > 0) {
+            const avgCenter = new THREE.Vector3();
+            this.scenes.forEach((scene) => {
+                avgCenter.add(scene.splatBuffer.sceneCenter);
+            });
+            avgCenter.multiplyScalar(1.0 / this.scenes.length);
+            this.calculatedSceneCenter.copy(avgCenter);
+        }
+
+        this.material.uniforms.sceneCenter.value.copy(this.calculatedSceneCenter);
+        this.material.uniforms.visibleRegionFadeStartRadius.value = this.visibleRegionFadeStartRadius;
+        this.material.uniforms.visibleRegionRadius.value = this.visibleRegionRadius;
+        this.material.uniforms.firstRenderTime.value = this.firstRenderTime;
+        this.material.uniforms.currentTime.value = performance.now();
+        this.material.uniforms.fadeInComplete.value = 1;
+        this.material.uniformsNeedUpdate = true;
+        this.visibleRegionChanging = false;
+    }
+
+    updateVisibleRegion(sinceLastBuildOnly, sceneRevealMode = SceneRevealMode.Default) {
         const splatCount = this.getSplatCount(true);
         const tempCenter = new THREE.Vector3();
         if (!sinceLastBuildOnly) {
@@ -1195,7 +2106,7 @@ export class SplatMesh extends THREE.Mesh {
             this.visibleRegionRadius = Math.max(this.visibleRegionBufferRadius - VISIBLE_REGION_EXPANSION_DELTA, 0.0);
         }
         if (this.finalBuild) this.visibleRegionRadius = this.visibleRegionBufferRadius = this.maxSplatDistanceFromSceneCenter;
-        this.updateVisibleRegionFadeDistance();
+        this.updateVisibleRegionFadeDistance(sceneRevealMode);
     }
 
     updateVisibleRegionFadeDistance(sceneRevealMode = SceneRevealMode.Default) {
@@ -1216,7 +2127,7 @@ export class SplatMesh extends THREE.Mesh {
         this.material.uniforms.currentTime.value = performance.now();
         this.material.uniforms.fadeInComplete.value = shaderFadeInComplete;
         this.material.uniformsNeedUpdate = true;
-        this.visibleRegionChanging = !fadeInComplete;
+        this.visibleRegionChanging = !shaderFadeInComplete;
     }
 
     /**
@@ -1387,6 +2298,7 @@ export class SplatMesh extends THREE.Mesh {
      */
     setRenderer(renderer) {
         if (renderer !== this.renderer) {
+            if (this.renderer && this.precompiledMaterial) this.clearPrecompiledMaterial();
             this.renderer = renderer;
             const gl = this.renderer.getContext();
             const extensions = new WebGLExtensions(gl);
@@ -1666,11 +2578,11 @@ export class SplatMesh extends THREE.Mesh {
      */
     getSceneIndexes(start, end) {
 
-        let sceneIndexes;
         const fillCount = end - start + 1;
-        sceneIndexes = new Uint32Array(fillCount);
-        for (let i = start; i <= end; i++) {
-            sceneIndexes[i] = this.globalSplatIndexToSceneIndexMap[i];
+        const sceneIndexes = new Uint32Array(fillCount);
+        if (this.implicitSingleSceneIndexMap) return sceneIndexes;
+        for (let i = 0; i < fillCount; i++) {
+            sceneIndexes[i] = this.globalSplatIndexToSceneIndexMap[start + i];
         }
 
         return sceneIndexes;
@@ -1901,6 +2813,151 @@ export class SplatMesh extends THREE.Mesh {
         }
     }
 
+    fillSplatCompressedTextureUVs(outUVArray, srcFrom, srcEnd, destStart) {
+        let currentDest = destStart * 2;
+
+        for (let i = srcFrom; i <= srcEnd; i++) {
+            const localIndex = this.getSplatLocalIndex(i);
+            const splatBuffer = this.getSplatBufferForSplat(i);
+            const sectionIndex = splatBuffer.globalSplatIndexToSectionMap[localIndex];
+            const section = splatBuffer.sections[sectionIndex];
+            const inSectionIndex = localIndex - section.splatCountOffset;
+
+            const compressionLevel = splatBuffer.compressionLevel;
+            const shOffset = splatBuffer.constructor.CompressionLevels[compressionLevel].SphericalHarmonicsOffsetBytes;
+            const baseOffset = section.dataBase + inSectionIndex * section.bytesPerSplat + shOffset;
+
+            const dataView = new DataView(splatBuffer.bufferData, baseOffset, 8);
+            const u = dataView.getUint32(0, true);
+            const v = dataView.getUint32(4, true);
+
+            outUVArray[currentDest] = u;
+            outUVArray[currentDest + 1] = v;
+
+            currentDest += 2;
+        }
+    }
+
+    fillSplatASTCUVs(outUVArray, srcFrom, srcEnd, destStart) {
+        return this.fillSplatCompressedTextureUVs(outUVArray, srcFrom, srcEnd, destStart);
+    }
+
+    fillDirectCompressedTextureDataArrays = function() {
+
+        const scale = new THREE.Vector3();
+        const rotation = new THREE.Quaternion();
+        const tempMatrix4 = new THREE.Matrix4();
+        const scaleMatrix = new THREE.Matrix3();
+        const rotationMatrix = new THREE.Matrix3();
+        const covarianceMatrix = new THREE.Matrix3();
+        const transformedCovariance = new THREE.Matrix3();
+        const toHalfFloat = THREE.DataUtils.toHalfFloat.bind(THREE.DataUtils);
+
+        const writeCovariance = (scale, rotation, outCovariance, outOffset, desiredOutputCompressionLevel) => {
+            tempMatrix4.makeScale(scale.x, scale.y, scale.z);
+            scaleMatrix.setFromMatrix4(tempMatrix4);
+            tempMatrix4.makeRotationFromQuaternion(rotation);
+            rotationMatrix.setFromMatrix4(tempMatrix4);
+            covarianceMatrix.copy(rotationMatrix).multiply(scaleMatrix);
+            transformedCovariance.copy(covarianceMatrix).transpose().premultiply(covarianceMatrix);
+
+            if (desiredOutputCompressionLevel >= 1) {
+                outCovariance[outOffset] = toHalfFloat(transformedCovariance.elements[0]);
+                outCovariance[outOffset + 1] = toHalfFloat(transformedCovariance.elements[3]);
+                outCovariance[outOffset + 2] = toHalfFloat(transformedCovariance.elements[6]);
+                outCovariance[outOffset + 3] = toHalfFloat(transformedCovariance.elements[4]);
+                outCovariance[outOffset + 4] = toHalfFloat(transformedCovariance.elements[7]);
+                outCovariance[outOffset + 5] = toHalfFloat(transformedCovariance.elements[8]);
+            } else {
+                outCovariance[outOffset] = transformedCovariance.elements[0];
+                outCovariance[outOffset + 1] = transformedCovariance.elements[3];
+                outCovariance[outOffset + 2] = transformedCovariance.elements[6];
+                outCovariance[outOffset + 3] = transformedCovariance.elements[4];
+                outCovariance[outOffset + 4] = transformedCovariance.elements[7];
+                outCovariance[outOffset + 5] = transformedCovariance.elements[8];
+            }
+        };
+
+        return function(fromSplat, toSplat, covarianceCompressionLevel = 0, scaleRotationCompressionLevel = 0) {
+            if (!this.useCompressedTexture || this.dynamicMode || this.scenes.length !== 1) return false;
+
+            const scene = this.scenes[0];
+            if (scene.position.lengthSq() !== 0 ||
+                scene.quaternion.x !== 0 || scene.quaternion.y !== 0 || scene.quaternion.z !== 0 || scene.quaternion.w !== 1 ||
+                scene.scale.x !== 1 || scene.scale.y !== 1 || scene.scale.z !== 1) {
+                return false;
+            }
+
+            const directData = scene.splatBuffer.directCompressedTextureData || scene.splatBuffer.directASTCData;
+            if (!directData) return false;
+
+            const covariances = this.splatDataTextures.baseData.covariances;
+            const scales = this.splatDataTextures.baseData.scales;
+            const rotations = this.splatDataTextures.baseData.rotations;
+            const centers = this.splatDataTextures.baseData.centers;
+            const colors = this.splatDataTextures.baseData.colors;
+            const compressedTextureUVs = this.splatDataTextures.baseData.compressedTextureUVs;
+            const directPositions = directData.positions;
+            const directScales = directData.scales;
+            const directRotations = directData.rotations;
+            const directColors = directData.colors;
+            const directCompressedTextureUVs = directData.uvs || directData.astcUVs;
+            const directCovariances = directData.covariances;
+            const scaleConversion = scaleRotationCompressionLevel >= 1 ? toHalfFloat : (v) => v;
+
+            for (let i = fromSplat; i <= toSplat; i++) {
+                const centerBase = i * 3;
+                const rotationBase = i * 4;
+                const uvBase = i * 2;
+                const covarianceBase = i * 6;
+
+                centers[centerBase] = directPositions[centerBase];
+                centers[centerBase + 1] = directPositions[centerBase + 1];
+                centers[centerBase + 2] = directPositions[centerBase + 2];
+
+                scale.set(directScales[centerBase], directScales[centerBase + 1], directScales[centerBase + 2]);
+                rotation.set(directRotations[rotationBase + 1],
+                             directRotations[rotationBase + 2],
+                             directRotations[rotationBase + 3],
+                             directRotations[rotationBase]).normalize();
+                const flip = rotation.w < 0 ? -1 : 1;
+
+                if (scales) {
+                    scales[centerBase] = scaleConversion(scale.x);
+                    scales[centerBase + 1] = scaleConversion(scale.y);
+                    scales[centerBase + 2] = scaleConversion(scale.z);
+                }
+                if (rotations) {
+                    rotations[rotationBase] = scaleConversion(rotation.x * flip);
+                    rotations[rotationBase + 1] = scaleConversion(rotation.y * flip);
+                    rotations[rotationBase + 2] = scaleConversion(rotation.z * flip);
+                    rotations[rotationBase + 3] = scaleConversion(rotation.w * flip);
+                }
+
+                colors[rotationBase] = directColors[rotationBase];
+                colors[rotationBase + 1] = directColors[rotationBase + 1];
+                colors[rotationBase + 2] = directColors[rotationBase + 2];
+                colors[rotationBase + 3] = directColors[rotationBase + 3];
+
+                compressedTextureUVs[uvBase] = directCompressedTextureUVs[uvBase];
+                compressedTextureUVs[uvBase + 1] = directCompressedTextureUVs[uvBase + 1];
+
+                if (directCovariances && covarianceCompressionLevel === 0) {
+                    covariances.set(directCovariances.subarray(covarianceBase, covarianceBase + 6), covarianceBase);
+                } else {
+                    writeCovariance(scale, rotation, covariances, covarianceBase, covarianceCompressionLevel);
+                }
+            }
+
+            return true;
+        };
+
+    }();
+
+    fillDirectASTCDataArrays(...args) {
+        return this.fillDirectCompressedTextureDataArrays(...args);
+    }
+
     /**
      * Convert splat centers, which are floating point values, to an array of integers and multiply
      * each by 1000. Centers will get transformed as appropriate before conversion to integer.
@@ -2039,19 +3096,21 @@ export class SplatMesh extends THREE.Mesh {
     }
 
     getSplatBufferForSplat(globalIndex) {
-        return this.getScene(this.globalSplatIndexToSceneIndexMap[globalIndex]).splatBuffer;
+        const sceneIndex = this.implicitSingleSceneIndexMap ? 0 : this.globalSplatIndexToSceneIndexMap[globalIndex];
+        return this.getScene(sceneIndex).splatBuffer;
     }
 
     getSceneIndexForSplat(globalIndex) {
-        return this.globalSplatIndexToSceneIndexMap[globalIndex];
+        return this.implicitSingleSceneIndexMap ? 0 : this.globalSplatIndexToSceneIndexMap[globalIndex];
     }
 
     getSceneTransformForSplat(globalIndex) {
-        return this.getScene(this.globalSplatIndexToSceneIndexMap[globalIndex]).transform;
+        const sceneIndex = this.implicitSingleSceneIndexMap ? 0 : this.globalSplatIndexToSceneIndexMap[globalIndex];
+        return this.getScene(sceneIndex).transform;
     }
 
     getSplatLocalIndex(globalIndex) {
-        return this.globalSplatIndexToLocalSplatIndexMap[globalIndex];
+        return this.implicitSingleSceneIndexMap ? globalIndex : this.globalSplatIndexToLocalSplatIndexMap[globalIndex];
     }
 
     static getIntegerMatrixArray(matrix) {

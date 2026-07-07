@@ -1,0 +1,2457 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light">
+  <title>UWA Browser Capability Probe</title>
+  <style>
+    :root {
+      --page-bg: #f3f6fa;
+      --card-bg: #ffffff;
+      --text: #18202a;
+      --muted: #637083;
+      --line: #dfe5ec;
+      --accent: #2457d6;
+      --accent-hover: #1746bd;
+      --pass: #087a43;
+      --pass-bg: #e8f7ef;
+      --warn: #9a5a00;
+      --warn-bg: #fff4d8;
+      --fail: #b42318;
+      --fail-bg: #ffebe9;
+      --info: #3f5268;
+      --info-bg: #edf2f7;
+      --running: #2457d6;
+      --running-bg: #edf3ff;
+      --shadow: 0 10px 28px rgba(39, 55, 75, 0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      -webkit-text-size-adjust: 100%;
+    }
+
+    body {
+      margin: 0;
+      min-width: 280px;
+      background: var(--page-bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+        "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      line-height: 1.55;
+    }
+
+    button,
+    summary {
+      font: inherit;
+    }
+
+    button {
+      min-height: 44px;
+      border: 1px solid transparent;
+      border-radius: 10px;
+      padding: 10px 14px;
+      background: var(--accent);
+      color: #ffffff;
+      font-weight: 700;
+      cursor: pointer;
+      touch-action: manipulation;
+      transition: background 120ms ease, opacity 120ms ease, transform 120ms ease;
+    }
+
+    button:hover {
+      background: var(--accent-hover);
+    }
+
+    button:active {
+      transform: translateY(1px);
+    }
+
+    button:focus-visible,
+    summary:focus-visible {
+      outline: 3px solid rgba(36, 87, 214, 0.24);
+      outline-offset: 2px;
+    }
+
+    button.secondary {
+      border-color: #b9c5d3;
+      background: #ffffff;
+      color: #26384d;
+    }
+
+    button.secondary:hover {
+      background: #f6f8fb;
+    }
+
+    button:disabled {
+      cursor: wait;
+      opacity: 0.56;
+      transform: none;
+    }
+
+    .page {
+      width: min(100%, 840px);
+      margin: 0 auto;
+      padding: 20px max(14px, env(safe-area-inset-right))
+        max(36px, env(safe-area-inset-bottom))
+        max(14px, env(safe-area-inset-left));
+    }
+
+    .hero {
+      padding: 12px 2px 18px;
+    }
+
+    .eyebrow {
+      margin-bottom: 5px;
+      color: var(--accent);
+      font-size: 0.82rem;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(1.65rem, 7vw, 2.45rem);
+      line-height: 1.22;
+      letter-spacing: -0.025em;
+    }
+
+    .hero p {
+      margin: 10px 0 0;
+      color: var(--muted);
+      font-size: 0.96rem;
+    }
+
+    .local-note {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      margin-top: 13px;
+      border: 1px solid #cad6e5;
+      border-radius: 999px;
+      padding: 5px 10px;
+      background: rgba(255, 255, 255, 0.72);
+      color: #405269;
+      font-size: 0.82rem;
+    }
+
+    .card {
+      margin-bottom: 14px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: var(--card-bg);
+      box-shadow: var(--shadow);
+    }
+
+    .verdict {
+      overflow: hidden;
+      border-left: 6px solid var(--running);
+      padding: 20px;
+    }
+
+    .verdict.is-pass {
+      border-left-color: var(--pass);
+      background: linear-gradient(135deg, #ffffff 25%, var(--pass-bg));
+    }
+
+    .verdict.is-warning {
+      border-left-color: var(--warn);
+      background: linear-gradient(135deg, #ffffff 25%, var(--warn-bg));
+    }
+
+    .verdict.is-fail {
+      border-left-color: var(--fail);
+      background: linear-gradient(135deg, #ffffff 25%, var(--fail-bg));
+    }
+
+    .verdict.is-running {
+      border-left-color: var(--running);
+      background: linear-gradient(135deg, #ffffff 25%, var(--running-bg));
+    }
+
+    .verdict-label {
+      color: var(--muted);
+      font-size: 0.82rem;
+      font-weight: 800;
+      letter-spacing: 0.06em;
+    }
+
+    .verdict h2 {
+      margin: 4px 0 8px;
+      font-size: clamp(1.3rem, 5vw, 1.8rem);
+      line-height: 1.3;
+    }
+
+    .verdict ul {
+      margin: 8px 0 0;
+      padding-left: 1.25em;
+      color: #405064;
+      font-size: 0.92rem;
+    }
+
+    .verdict-meta {
+      margin-top: 12px;
+      color: var(--muted);
+      font-size: 0.78rem;
+    }
+
+    .actions {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 9px;
+      margin: 14px 0 8px;
+    }
+
+    .feedback {
+      min-height: 25px;
+      margin: 0 2px 12px;
+      color: var(--muted);
+      font-size: 0.84rem;
+    }
+
+    .feedback.is-success {
+      color: var(--pass);
+    }
+
+    .feedback.is-error {
+      color: var(--fail);
+    }
+
+    .section-heading {
+      padding: 17px 18px 10px;
+    }
+
+    .section-heading h2 {
+      margin: 0;
+      font-size: 1.08rem;
+    }
+
+    .section-heading p {
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-size: 0.82rem;
+    }
+
+    .checks {
+      padding: 0 14px 8px;
+    }
+
+    .check-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 11px;
+      align-items: start;
+      border-top: 1px solid var(--line);
+      padding: 13px 4px;
+    }
+
+    .check-name {
+      margin: 0 0 2px;
+      font-size: 0.95rem;
+      font-weight: 750;
+    }
+
+    .check-explanation {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.84rem;
+      overflow-wrap: anywhere;
+    }
+
+    .status {
+      display: inline-flex;
+      min-width: 54px;
+      justify-content: center;
+      border-radius: 999px;
+      padding: 4px 8px;
+      font-size: 0.76rem;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+
+    .status-pass {
+      background: var(--pass-bg);
+      color: var(--pass);
+    }
+
+    .status-warn {
+      background: var(--warn-bg);
+      color: var(--warn);
+    }
+
+    .status-unsupported {
+      background: var(--fail-bg);
+      color: var(--fail);
+    }
+
+    .status-info {
+      background: var(--info-bg);
+      color: var(--info);
+    }
+
+    .loading-row {
+      border-top: 1px solid var(--line);
+      padding: 14px 4px;
+      color: var(--muted);
+      font-size: 0.87rem;
+    }
+
+    .loading-row::before {
+      display: inline-block;
+      width: 0.75em;
+      height: 0.75em;
+      margin-right: 8px;
+      border: 2px solid #b8c8e9;
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      content: "";
+      vertical-align: -0.08em;
+      animation: spin 0.8s linear infinite;
+    }
+
+    @keyframes spin {
+      to {
+        transform: rotate(360deg);
+      }
+    }
+
+    details.card {
+      overflow: hidden;
+    }
+
+    summary {
+      padding: 16px 18px;
+      font-weight: 750;
+      cursor: pointer;
+      user-select: none;
+    }
+
+    pre {
+      max-height: 58vh;
+      margin: 0;
+      border-top: 1px solid var(--line);
+      padding: 16px;
+      overflow: auto;
+      background: #111923;
+      color: #d9e6f5;
+      font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      tab-size: 2;
+    }
+
+    footer {
+      padding: 6px 2px 0;
+      color: var(--muted);
+      font-size: 0.79rem;
+      text-align: center;
+    }
+
+    @media (max-width: 560px) {
+      .page {
+        padding-top: 12px;
+      }
+
+      .actions {
+        grid-template-columns: 1fr;
+      }
+
+      .verdict {
+        padding: 17px 15px;
+      }
+
+      .section-heading {
+        padding-inline: 15px;
+      }
+
+      .checks {
+        padding-inline: 11px;
+      }
+
+      .check-row {
+        gap: 8px;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      * {
+        scroll-behavior: auto !important;
+        transition: none !important;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="hero">
+      <div class="eyebrow">UWA Local Diagnostics</div>
+      <h1>Browser Capability Probe</h1>
+      <p>Tests the WebGL2, WASM, Worker, and transfer capabilities actually used by the UWA/GLB viewer.</p>
+      <div class="local-note" aria-label="Privacy notice">🔒 Results are generated locally; no data is uploaded</div>
+    </header>
+
+    <section id="verdictCard" class="card verdict is-running" aria-live="polite">
+      <div class="verdict-label">Overall result</div>
+      <h2 id="verdictTitle">Testing</h2>
+      <ul id="verdictReasons">
+        <li>Running functional tests. Please wait.</li>
+      </ul>
+      <div id="verdictMeta" class="verdict-meta">Starts automatically after the page loads</div>
+    </section>
+
+    <div class="actions" aria-label="Probe actions">
+      <button id="rerunButton" type="button">Run again</button>
+      <button id="copySummaryButton" class="secondary" type="button" disabled>Copy summary</button>
+      <button id="copyJsonButton" class="secondary" type="button" disabled>Copy JSON</button>
+    </div>
+    <div id="feedback" class="feedback" role="status" aria-live="polite"></div>
+
+    <section class="card" aria-labelledby="coreHeading">
+      <div class="section-heading">
+        <h2 id="coreHeading">Core capabilities</h2>
+        <p>Baseline browser and shader requirements for this project</p>
+      </div>
+      <div id="checks-core" class="checks">
+        <div class="loading-row">Testing</div>
+      </div>
+    </section>
+
+    <section class="card" aria-labelledby="gpuHeading">
+      <div class="section-heading">
+        <h2 id="gpuHeading">GPU / ASTC</h2>
+        <p>Required GPU limits, recommended acceleration, and supplementary information</p>
+      </div>
+      <div id="checks-gpu" class="checks">
+        <div class="loading-row">Testing</div>
+      </div>
+    </section>
+
+    <section class="card" aria-labelledby="runtimeHeading">
+      <div class="section-heading">
+        <h2 id="runtimeHeading">Worker / WASM</h2>
+        <p>Capabilities required for decoding, sorting, and cross-thread data transfer</p>
+      </div>
+      <div id="checks-runtime" class="checks">
+        <div class="loading-row">Testing</div>
+      </div>
+    </section>
+
+    <section class="card" aria-labelledby="environmentHeading">
+      <div class="section-heading">
+        <h2 id="environmentHeading">Environment information</h2>
+        <p>Diagnostic only; device model and thread count do not determine correctness</p>
+      </div>
+      <div id="checks-environment" class="checks">
+        <div class="loading-row">Testing</div>
+      </div>
+    </section>
+
+    <details class="card">
+      <summary>Raw JSON details</summary>
+      <pre id="rawJson">Testing…</pre>
+    </details>
+
+    <footer>
+      Browser privacy policies may hide or generalize GPU identifiers. This page does not load models, allocate large textures, or send network requests.
+    </footer>
+  </main>
+
+  <script>
+    (function () {
+      "use strict";
+
+      var PROBE_VERSION = "2026-07-26";
+      var WORKER_TIMEOUT_MS = 10000;
+      var FILE_READER_TIMEOUT_MS = 3000;
+      var currentResult = null;
+      var runSequence = 0;
+      var feedbackTimer = null;
+
+      var verdictCard = document.getElementById("verdictCard");
+      var verdictTitle = document.getElementById("verdictTitle");
+      var verdictReasons = document.getElementById("verdictReasons");
+      var verdictMeta = document.getElementById("verdictMeta");
+      var rawJson = document.getElementById("rawJson");
+      var rerunButton = document.getElementById("rerunButton");
+      var copySummaryButton = document.getElementById("copySummaryButton");
+      var copyJsonButton = document.getElementById("copyJsonButton");
+      var feedback = document.getElementById("feedback");
+
+      var groupElements = {
+        core: document.getElementById("checks-core"),
+        gpu: document.getElementById("checks-gpu"),
+        runtime: document.getElementById("checks-runtime"),
+        environment: document.getElementById("checks-environment")
+      };
+
+      var STATUS_LABELS = {
+        pass: "Pass",
+        warn: "Warning",
+        unsupported: "Unsupported",
+        info: "Information"
+      };
+
+      function nowMs() {
+        if (typeof performance !== "undefined" && typeof performance.now === "function") {
+          return performance.now();
+        }
+        return Date.now();
+      }
+
+      function roundMs(value) {
+        return Math.round(Math.max(0, Number(value) || 0) * 100) / 100;
+      }
+
+      function serializeError(error) {
+        if (!error) return null;
+        return {
+          name: error.name || "Error",
+          message: error.message || String(error)
+        };
+      }
+
+      function errorMessage(error) {
+        var serialized = serializeError(error);
+        return serialized ? serialized.name + ": " + serialized.message : "Unknown error";
+      }
+
+      function normalizeGlValue(value) {
+        if (ArrayBuffer.isView(value)) return Array.prototype.slice.call(value);
+        return value;
+      }
+
+      function safeGlParameter(gl, parameter) {
+        try {
+          return normalizeGlValue(gl.getParameter(parameter));
+        } catch (error) {
+          return null;
+        }
+      }
+
+      function safeGlExtension(gl, names) {
+        var candidates = Array.isArray(names) ? names : [names];
+        for (var i = 0; i < candidates.length; i++) {
+          try {
+            var extension = gl.getExtension(candidates[i]);
+            if (extension) return extension;
+          } catch (error) {
+            // Continue with the next spelling.
+          }
+        }
+        return null;
+      }
+
+      function loseContext(gl) {
+        if (!gl) return;
+        try {
+          var extension = gl.getExtension("WEBGL_lose_context");
+          if (extension) extension.loseContext();
+        } catch (error) {
+          // Cleanup is best effort.
+        }
+      }
+
+      function detectWebGL1(contextAttributes) {
+        var canvas = document.createElement("canvas");
+        canvas.width = 1;
+        canvas.height = 1;
+        var gl = null;
+        var result = {
+          available: false,
+          version: null,
+          error: null
+        };
+
+        try {
+          gl = canvas.getContext("webgl", contextAttributes) ||
+            canvas.getContext("experimental-webgl", contextAttributes);
+          result.available = !!gl;
+          result.version = gl ? safeGlParameter(gl, gl.VERSION) : null;
+        } catch (error) {
+          result.error = serializeError(error);
+        } finally {
+          loseContext(gl);
+        }
+        return result;
+      }
+
+      function compileShader(gl, type, source) {
+        var shader = null;
+        try {
+          shader = gl.createShader(type);
+          if (!shader) {
+            return { compiled: false, log: "createShader returned null", shader: null };
+          }
+          gl.shaderSource(shader, source);
+          gl.compileShader(shader);
+          return {
+            compiled: !!gl.getShaderParameter(shader, gl.COMPILE_STATUS),
+            log: gl.getShaderInfoLog(shader) || "",
+            shader: shader
+          };
+        } catch (error) {
+          return {
+            compiled: false,
+            log: errorMessage(error),
+            shader: shader
+          };
+        }
+      }
+
+      function framebufferStatusName(gl, status) {
+        var names = {};
+        names[gl.FRAMEBUFFER_COMPLETE] = "FRAMEBUFFER_COMPLETE";
+        names[gl.FRAMEBUFFER_INCOMPLETE_ATTACHMENT] = "FRAMEBUFFER_INCOMPLETE_ATTACHMENT";
+        names[gl.FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT] = "FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT";
+        names[gl.FRAMEBUFFER_INCOMPLETE_DIMENSIONS] = "FRAMEBUFFER_INCOMPLETE_DIMENSIONS";
+        names[gl.FRAMEBUFFER_UNSUPPORTED] = "FRAMEBUFFER_UNSUPPORTED";
+        names[gl.FRAMEBUFFER_INCOMPLETE_MULTISAMPLE] = "FRAMEBUFFER_INCOMPLETE_MULTISAMPLE";
+        return names[status] || "FRAMEBUFFER_STATUS_" + status;
+      }
+
+      function probeProjectShader(gl) {
+        var vertexSource = [
+          "#version 300 es",
+          "precision highp float;",
+          "precision highp int;",
+          "precision highp usampler2D;",
+          "precision highp sampler2DArray;",
+          "layout(location = 0) in uint splatIndex;",
+          "uniform highp usampler2D centersColorsTexture;",
+          "uniform highp sampler2DArray astcTextures;",
+          "flat out uint packedValue;",
+          "flat out vec4 astcValue;",
+          "void main() {",
+          "  ivec2 texel = ivec2(int(splatIndex), 0);",
+          "  packedValue = texelFetch(centersColorsTexture, texel, 0).x;",
+          "  astcValue = texelFetch(astcTextures, ivec3(0, 0, int(splatIndex)), 0);",
+          "  gl_Position = vec4(0.0, 0.0, 0.0, 1.0);",
+          "  gl_PointSize = 1.0;",
+          "}"
+        ].join("\n");
+
+        var fragmentSource = [
+          "#version 300 es",
+          "precision highp float;",
+          "precision highp int;",
+          "flat in uint packedValue;",
+          "flat in vec4 astcValue;",
+          "out vec4 fragmentColor;",
+          "void main() {",
+          "  float integerByte = float(packedValue & 255u) / 255.0;",
+          "  fragmentColor = vec4(integerByte, astcValue.g, 0.0, 1.0);",
+          "}"
+        ].join("\n");
+
+        var vertex = compileShader(gl, gl.VERTEX_SHADER, vertexSource);
+        var fragment = compileShader(gl, gl.FRAGMENT_SHADER, fragmentSource);
+        var program = null;
+        var vertexArray = null;
+        var vertexBuffer = null;
+        var integerTexture = null;
+        var arrayTexture = null;
+        var outputTexture = null;
+        var framebuffer = null;
+        var linked = false;
+        var linkLog = "";
+        var functional = {
+          drawAttempted: false,
+          setupPassed: false,
+          framebufferStatus: null,
+          framebufferComplete: false,
+          setupGlErrors: [],
+          drawPassed: false,
+          drawGlError: null,
+          readbackPassed: false,
+          readbackGlError: null,
+          expectedRgba: [17, 34, 0, 255],
+          actualRgba: null,
+          error: null
+        };
+
+        try {
+          if (vertex.compiled && fragment.compiled) {
+            program = gl.createProgram();
+            if (!program) {
+              linkLog = "createProgram returned null";
+            } else {
+              gl.attachShader(program, vertex.shader);
+              gl.attachShader(program, fragment.shader);
+              gl.linkProgram(program);
+              linked = !!gl.getProgramParameter(program, gl.LINK_STATUS);
+              linkLog = gl.getProgramInfoLog(program) || "";
+            }
+          }
+
+          if (linked) {
+            functional.drawAttempted = true;
+            clearGlErrors(gl);
+
+            vertexArray = gl.createVertexArray();
+            vertexBuffer = gl.createBuffer();
+            integerTexture = gl.createTexture();
+            arrayTexture = gl.createTexture();
+            outputTexture = gl.createTexture();
+            framebuffer = gl.createFramebuffer();
+            if (!vertexArray || !vertexBuffer || !integerTexture || !arrayTexture ||
+                !outputTexture || !framebuffer) {
+              throw new Error("Failed to create the WebGL2 resources required for the functional draw");
+            }
+
+            gl.bindVertexArray(vertexArray);
+            gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffer);
+            gl.bufferData(gl.ARRAY_BUFFER, new Uint32Array([0]), gl.STATIC_DRAW);
+            gl.enableVertexAttribArray(0);
+            gl.vertexAttribIPointer(0, 1, gl.UNSIGNED_INT, 0, 0);
+
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, integerTexture);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+            gl.texImage2D(
+              gl.TEXTURE_2D,
+              0,
+              gl.RGBA32UI,
+              1,
+              1,
+              0,
+              gl.RGBA_INTEGER,
+              gl.UNSIGNED_INT,
+              new Uint32Array([17, 0, 0, 0])
+            );
+
+            gl.activeTexture(gl.TEXTURE1);
+            gl.bindTexture(gl.TEXTURE_2D_ARRAY, arrayTexture);
+            gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+            gl.texImage3D(
+              gl.TEXTURE_2D_ARRAY,
+              0,
+              gl.RGBA8,
+              1,
+              1,
+              1,
+              0,
+              gl.RGBA,
+              gl.UNSIGNED_BYTE,
+              new Uint8Array([0, 34, 0, 255])
+            );
+
+            gl.bindTexture(gl.TEXTURE_2D, outputTexture);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+            gl.texImage2D(
+              gl.TEXTURE_2D,
+              0,
+              gl.RGBA8,
+              1,
+              1,
+              0,
+              gl.RGBA,
+              gl.UNSIGNED_BYTE,
+              null
+            );
+            gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+            gl.framebufferTexture2D(
+              gl.FRAMEBUFFER,
+              gl.COLOR_ATTACHMENT0,
+              gl.TEXTURE_2D,
+              outputTexture,
+              0
+            );
+
+            var framebufferStatus = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+            functional.framebufferStatus = framebufferStatusName(gl, framebufferStatus);
+            functional.framebufferComplete = framebufferStatus === gl.FRAMEBUFFER_COMPLETE;
+            functional.setupGlErrors = clearGlErrors(gl);
+            functional.setupPassed =
+              functional.framebufferComplete && functional.setupGlErrors.length === 0;
+
+            if (functional.setupPassed) {
+              gl.viewport(0, 0, 1, 1);
+              gl.disable(gl.BLEND);
+              gl.disable(gl.DITHER);
+              gl.colorMask(true, true, true, true);
+              gl.clearColor(0, 0, 0, 0);
+              gl.clear(gl.COLOR_BUFFER_BIT);
+              gl.useProgram(program);
+
+              var integerSamplerLocation =
+                gl.getUniformLocation(program, "centersColorsTexture");
+              var arraySamplerLocation = gl.getUniformLocation(program, "astcTextures");
+              if (integerSamplerLocation === null || arraySamplerLocation === null) {
+                throw new Error("The functional shader sampler uniform did not remain active");
+              }
+              gl.uniform1i(integerSamplerLocation, 0);
+              gl.uniform1i(arraySamplerLocation, 1);
+              gl.drawArrays(gl.POINTS, 0, 1);
+
+              var drawError = gl.getError();
+              functional.drawGlError = glErrorName(gl, drawError);
+              functional.drawPassed = drawError === gl.NO_ERROR;
+
+              if (functional.drawPassed) {
+                var pixels = new Uint8Array(4);
+                gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+                var readbackError = gl.getError();
+                functional.readbackGlError = glErrorName(gl, readbackError);
+                functional.actualRgba = Array.prototype.slice.call(pixels);
+                functional.readbackPassed =
+                  readbackError === gl.NO_ERROR &&
+                  functional.actualRgba.every(function (value, index) {
+                    return value === functional.expectedRgba[index];
+                  });
+              }
+            }
+          }
+        } catch (error) {
+          if (!linked) linkLog = errorMessage(error);
+          functional.error = serializeError(error);
+        } finally {
+          try {
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+            gl.bindVertexArray(null);
+            gl.bindBuffer(gl.ARRAY_BUFFER, null);
+            gl.useProgram(null);
+            gl.activeTexture(gl.TEXTURE1);
+            gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, null);
+          } catch (error) {
+            // Context cleanup below is still best effort.
+          }
+          if (framebuffer) gl.deleteFramebuffer(framebuffer);
+          if (outputTexture) gl.deleteTexture(outputTexture);
+          if (arrayTexture) gl.deleteTexture(arrayTexture);
+          if (integerTexture) gl.deleteTexture(integerTexture);
+          if (vertexBuffer) gl.deleteBuffer(vertexBuffer);
+          if (vertexArray) gl.deleteVertexArray(vertexArray);
+          if (program) gl.deleteProgram(program);
+          if (vertex.shader) gl.deleteShader(vertex.shader);
+          if (fragment.shader) gl.deleteShader(fragment.shader);
+        }
+
+        return {
+          passed: vertex.compiled && fragment.compiled && linked &&
+            functional.readbackPassed,
+          functionalPassed: functional.readbackPassed,
+          vertexCompiled: vertex.compiled,
+          fragmentCompiled: fragment.compiled,
+          linked: linked,
+          vertexLog: vertex.log,
+          fragmentLog: fragment.log,
+          linkLog: linkLog,
+          functionalDraw: functional,
+          exercisedFeatures: [
+            "GLSL ES 3.00",
+            "uint",
+            "usampler2D",
+            "sampler2DArray",
+            "highp",
+            "texelFetch",
+            "RGBA32UI",
+            "vertexAttribIPointer",
+            "draw/readPixels"
+          ]
+        };
+      }
+
+      function glErrorName(gl, code) {
+        var names = {};
+        names[gl.NO_ERROR] = "NO_ERROR";
+        names[gl.INVALID_ENUM] = "INVALID_ENUM";
+        names[gl.INVALID_VALUE] = "INVALID_VALUE";
+        names[gl.INVALID_OPERATION] = "INVALID_OPERATION";
+        names[gl.OUT_OF_MEMORY] = "OUT_OF_MEMORY";
+        names[gl.INVALID_FRAMEBUFFER_OPERATION] = "INVALID_FRAMEBUFFER_OPERATION";
+        if (typeof gl.CONTEXT_LOST_WEBGL === "number") {
+          names[gl.CONTEXT_LOST_WEBGL] = "CONTEXT_LOST_WEBGL";
+        }
+        return names[code] || "GL_ERROR_" + code;
+      }
+
+      function clearGlErrors(gl) {
+        var cleared = [];
+        for (var i = 0; i < 8; i++) {
+          var code = gl.getError();
+          if (code === gl.NO_ERROR) break;
+          cleared.push(glErrorName(gl, code));
+        }
+        return cleared;
+      }
+
+      function probeAstc(gl) {
+        var extension = safeGlExtension(gl, "WEBGL_compressed_texture_astc");
+        var result = {
+          extensionSupported: !!extension,
+          profiles: [],
+          uploadAttempted: false,
+          uploadPassed: false,
+          format: "COMPRESSED_RGBA_ASTC_4x4_KHR",
+          dimensions: [4, 4, 1],
+          payloadBytes: 16,
+          glError: null,
+          priorErrorsCleared: [],
+          error: null
+        };
+
+        if (!extension) return result;
+
+        try {
+          if (typeof extension.getSupportedProfiles === "function") {
+            result.profiles = extension.getSupportedProfiles() || [];
+          }
+        } catch (error) {
+          result.profilesError = serializeError(error);
+        }
+
+        var texture = null;
+        try {
+          if (typeof gl.compressedTexImage3D !== "function") {
+            throw new Error("compressedTexImage3D is unavailable");
+          }
+          if (typeof extension.COMPRESSED_RGBA_ASTC_4x4_KHR !== "number") {
+            throw new Error("The ASTC 4x4 format constant is unavailable");
+          }
+
+          texture = gl.createTexture();
+          if (!texture) throw new Error("createTexture returned null");
+          gl.bindTexture(gl.TEXTURE_2D_ARRAY, texture);
+          gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+          gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+          gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+          gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+          result.priorErrorsCleared = clearGlErrors(gl);
+          result.uploadAttempted = true;
+
+          gl.compressedTexImage3D(
+            gl.TEXTURE_2D_ARRAY,
+            0,
+            extension.COMPRESSED_RGBA_ASTC_4x4_KHR,
+            4,
+            4,
+            1,
+            0,
+            new Uint8Array(16)
+          );
+
+          var code = gl.getError();
+          result.glError = glErrorName(gl, code);
+          result.uploadPassed = code === gl.NO_ERROR;
+        } catch (error) {
+          result.error = serializeError(error);
+        } finally {
+          try {
+            gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
+          } catch (error) {
+            // Cleanup is best effort.
+          }
+          if (texture) gl.deleteTexture(texture);
+        }
+        return result;
+      }
+
+      function probeWebGL() {
+        var contextAttributes = {
+          alpha: false,
+          antialias: false,
+          depth: false,
+          stencil: false,
+          preserveDrawingBuffer: false,
+          powerPreference: "high-performance",
+          failIfMajorPerformanceCaveat: false
+        };
+
+        var canvas = document.createElement("canvas");
+        canvas.width = 4;
+        canvas.height = 4;
+        var gl = null;
+        var result = {
+          webgl2Available: false,
+          contextLost: null,
+          contextAttributes: null,
+          contextCreationError: null,
+          webgl1: null,
+          identity: null,
+          limits: null,
+          shaderSmokeTest: null,
+          astc: null,
+          supplemental: null,
+          supportedExtensions: []
+        };
+
+        try {
+          gl = canvas.getContext("webgl2", contextAttributes);
+        } catch (error) {
+          result.contextCreationError = serializeError(error);
+        }
+
+        if (!gl) {
+          result.webgl1 = detectWebGL1(contextAttributes);
+          return result;
+        }
+
+        result.webgl2Available = true;
+        try {
+          result.contextLost = typeof gl.isContextLost === "function" ? gl.isContextLost() : false;
+          result.contextAttributes = gl.getContextAttributes ? gl.getContextAttributes() : null;
+
+          var debugInfo = safeGlExtension(gl, "WEBGL_debug_renderer_info");
+          result.identity = {
+            vendor: debugInfo ?
+              safeGlParameter(gl, debugInfo.UNMASKED_VENDOR_WEBGL) :
+              safeGlParameter(gl, gl.VENDOR),
+            renderer: debugInfo ?
+              safeGlParameter(gl, debugInfo.UNMASKED_RENDERER_WEBGL) :
+              safeGlParameter(gl, gl.RENDERER),
+            unmaskedInfoAvailable: !!debugInfo,
+            version: safeGlParameter(gl, gl.VERSION),
+            shadingLanguageVersion: safeGlParameter(gl, gl.SHADING_LANGUAGE_VERSION)
+          };
+
+          result.limits = {
+            maxTextureSize: safeGlParameter(gl, gl.MAX_TEXTURE_SIZE),
+            max3DTextureSize: safeGlParameter(gl, gl.MAX_3D_TEXTURE_SIZE),
+            maxArrayTextureLayers: safeGlParameter(gl, gl.MAX_ARRAY_TEXTURE_LAYERS),
+            maxCubeMapTextureSize: safeGlParameter(gl, gl.MAX_CUBE_MAP_TEXTURE_SIZE),
+            maxRenderbufferSize: safeGlParameter(gl, gl.MAX_RENDERBUFFER_SIZE),
+            maxTextureImageUnits: safeGlParameter(gl, gl.MAX_TEXTURE_IMAGE_UNITS),
+            maxVertexTextureImageUnits: safeGlParameter(gl, gl.MAX_VERTEX_TEXTURE_IMAGE_UNITS),
+            maxCombinedTextureImageUnits: safeGlParameter(gl, gl.MAX_COMBINED_TEXTURE_IMAGE_UNITS),
+            maxVertexAttribs: safeGlParameter(gl, gl.MAX_VERTEX_ATTRIBS),
+            maxVertexUniformVectors: safeGlParameter(gl, gl.MAX_VERTEX_UNIFORM_VECTORS),
+            maxFragmentUniformVectors: safeGlParameter(gl, gl.MAX_FRAGMENT_UNIFORM_VECTORS),
+            maxDrawBuffers: safeGlParameter(gl, gl.MAX_DRAW_BUFFERS),
+            maxColorAttachments: safeGlParameter(gl, gl.MAX_COLOR_ATTACHMENTS),
+            maxSamples: safeGlParameter(gl, gl.MAX_SAMPLES),
+            maxViewportDimensions: safeGlParameter(gl, gl.MAX_VIEWPORT_DIMS)
+          };
+          result.limits.requirementsPassed =
+            Number(result.limits.maxTextureSize) >= 4096 &&
+            Number(result.limits.maxVertexTextureImageUnits) > 0;
+
+          try {
+            result.shaderSmokeTest = probeProjectShader(gl);
+          } catch (error) {
+            result.shaderSmokeTest = {
+              passed: false,
+              error: serializeError(error)
+            };
+          }
+
+          try {
+            result.astc = probeAstc(gl);
+          } catch (error) {
+            result.astc = {
+              extensionSupported: false,
+              uploadAttempted: false,
+              uploadPassed: false,
+              error: serializeError(error)
+            };
+          }
+
+          var floatLinear = safeGlExtension(gl, "OES_texture_float_linear");
+          var colorBufferFloat = safeGlExtension(gl, "EXT_color_buffer_float");
+          var anisotropy = safeGlExtension(gl, [
+            "EXT_texture_filter_anisotropic",
+            "WEBKIT_EXT_texture_filter_anisotropic",
+            "MOZ_EXT_texture_filter_anisotropic"
+          ]);
+          result.supplemental = {
+            floatTextureSampling: true,
+            halfFloatTextureSampling: true,
+            floatTextureLinearFiltering: !!floatLinear,
+            colorBufferFloat: !!colorBufferFloat,
+            anisotropy: !!anisotropy,
+            maxAnisotropy: anisotropy ?
+              safeGlParameter(gl, anisotropy.MAX_TEXTURE_MAX_ANISOTROPY_EXT) :
+              null
+          };
+
+          try {
+            result.supportedExtensions = (gl.getSupportedExtensions() || []).slice().sort();
+          } catch (error) {
+            result.supportedExtensionsError = serializeError(error);
+          }
+        } finally {
+          loseContext(gl);
+        }
+        return result;
+      }
+
+      async function probeWasmBasic() {
+        var result = {
+          apiAvailable: typeof WebAssembly === "object",
+          validatePassed: false,
+          instantiatePassed: false,
+          supported: false,
+          error: null
+        };
+        if (!result.apiAvailable) return result;
+
+        var bytes = new Uint8Array([
+          0x00, 0x61, 0x73, 0x6d,
+          0x01, 0x00, 0x00, 0x00
+        ]);
+        try {
+          result.validatePassed = WebAssembly.validate(bytes);
+          if (result.validatePassed) {
+            await WebAssembly.instantiate(bytes);
+            result.instantiatePassed = true;
+          }
+          result.supported = result.validatePassed && result.instantiatePassed;
+        } catch (error) {
+          result.error = serializeError(error);
+        }
+        return result;
+      }
+
+      async function probeWasmSimd() {
+        var result = {
+          apiAvailable: typeof WebAssembly === "object",
+          validatePassed: false,
+          instantiatePassed: false,
+          supported: false,
+          probeScope: "minimal SIMD128 instruction module",
+          currentPublishedUwaArtifactsExecuted: false,
+          limitation: "Validates browser SIMD128 instruction support only; it does not execute the published UWA artifacts, JS glue, or memory configuration.",
+          error: null
+        };
+        if (!result.apiAvailable) return result;
+
+        // () -> v128. The function body uses i8x16.splat to produce a SIMD128 value.
+        var bytes = new Uint8Array([
+          0x00, 0x61, 0x73, 0x6d,
+          0x01, 0x00, 0x00, 0x00,
+          0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7b,
+          0x03, 0x02, 0x01, 0x00,
+          0x0a, 0x08, 0x01, 0x06, 0x00, 0x41, 0x00, 0xfd, 0x0f, 0x0b
+        ]);
+        try {
+          result.validatePassed = WebAssembly.validate(bytes);
+          if (result.validatePassed) {
+            await WebAssembly.instantiate(bytes);
+            result.instantiatePassed = true;
+          }
+          result.supported = result.validatePassed && result.instantiatePassed;
+        } catch (error) {
+          result.error = serializeError(error);
+        }
+        return result;
+      }
+
+      function workerPrerequisites() {
+        return typeof Worker === "function" &&
+          typeof Blob === "function" &&
+          typeof URL === "function" &&
+          typeof URL.createObjectURL === "function" &&
+          typeof URL.revokeObjectURL === "function";
+      }
+
+      function probeClassicWorker() {
+        return new Promise(function (resolve) {
+          var startedAt = nowMs();
+          var worker = null;
+          var objectUrl = null;
+          var timeoutId = null;
+          var finished = false;
+
+          function finish(payload) {
+            if (finished) return;
+            finished = true;
+            if (timeoutId !== null) clearTimeout(timeoutId);
+            if (worker) {
+              worker.onmessage = null;
+              worker.onerror = null;
+              worker.onmessageerror = null;
+              worker.terminate();
+            }
+            if (objectUrl) URL.revokeObjectURL(objectUrl);
+            payload.elapsedMs = roundMs(nowMs() - startedAt);
+            resolve(payload);
+          }
+
+          if (!workerPrerequisites()) {
+            finish({
+              supported: false,
+              roundTripPassed: false,
+              error: { name: "UnsupportedError", message: "Worker/Blob URL APIs are incomplete" }
+            });
+            return;
+          }
+
+          try {
+            var source = [
+              '"use strict";',
+              "self.onmessage = function (event) {",
+              '  if (event.data === "uwa-classic-ping") {',
+              '    self.postMessage("uwa-classic-pong");',
+              "  }",
+              "};"
+            ].join("\n");
+            objectUrl = URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
+            worker = new Worker(objectUrl);
+            worker.onmessage = function (event) {
+              var passed = event.data === "uwa-classic-pong";
+              finish({
+                supported: passed,
+                roundTripPassed: passed,
+                error: passed ? null : {
+                  name: "ProtocolError",
+                  message: "Classic Worker returned unexpected data"
+                }
+              });
+            };
+            worker.onerror = function (event) {
+              if (event && typeof event.preventDefault === "function") event.preventDefault();
+              finish({
+                supported: false,
+                roundTripPassed: false,
+                error: {
+                  name: "WorkerError",
+                  message: event && event.message ? event.message : "Classic Worker execution failed"
+                }
+              });
+            };
+            worker.onmessageerror = function () {
+              finish({
+                supported: false,
+                roundTripPassed: false,
+                error: { name: "MessageError", message: "Classic Worker message could not be deserialized" }
+              });
+            };
+            timeoutId = setTimeout(function () {
+              finish({
+                supported: false,
+                roundTripPassed: false,
+                timedOut: true,
+                error: {
+                  name: "TimeoutError",
+                  message: "Classic Worker test timed out after 10 seconds; keep the page in the foreground and retry on mobile or when background throttling is active"
+                }
+              });
+            }, WORKER_TIMEOUT_MS);
+            worker.postMessage("uwa-classic-ping");
+          } catch (error) {
+            finish({
+              supported: false,
+              roundTripPassed: false,
+              error: serializeError(error)
+            });
+          }
+        });
+      }
+
+      function probeModuleWorker() {
+        return new Promise(function (resolve) {
+          var startedAt = nowMs();
+          var worker = null;
+          var parentObjectUrl = null;
+          var childObjectUrl = null;
+          var timeoutId = null;
+          var finished = false;
+
+          function finish(payload) {
+            if (finished) return;
+            finished = true;
+            if (timeoutId !== null) clearTimeout(timeoutId);
+            if (worker) {
+              worker.onmessage = null;
+              worker.onerror = null;
+              worker.onmessageerror = null;
+              worker.terminate();
+            }
+            if (parentObjectUrl) URL.revokeObjectURL(parentObjectUrl);
+            if (childObjectUrl) URL.revokeObjectURL(childObjectUrl);
+            payload.elapsedMs = roundMs(nowMs() - startedAt);
+            resolve(payload);
+          }
+
+          if (!workerPrerequisites()) {
+            finish({
+              supported: false,
+              topLevelModuleExecuted: false,
+              childModuleExecuted: false,
+              nestedModuleWorkerPassed: false,
+              error: { name: "UnsupportedError", message: "Worker/Blob URL APIs are incomplete" }
+            });
+            return;
+          }
+
+          try {
+            var childSource = [
+              'export const childKind = "uwa-nested-module-child";',
+              "self.postMessage({ kind: childKind });"
+            ].join("\n");
+            childObjectUrl = URL.createObjectURL(
+              new Blob([childSource], { type: "text/javascript" })
+            );
+
+            var parentSource = [
+              'export const parentKind = "uwa-module-parent";',
+              "let childWorker = null;",
+              "let childTimeoutId = null;",
+              "function cleanupChild() {",
+              "  if (childTimeoutId !== null) clearTimeout(childTimeoutId);",
+              "  childTimeoutId = null;",
+              "  if (childWorker) {",
+              "    childWorker.onmessage = null;",
+              "    childWorker.onerror = null;",
+              "    childWorker.onmessageerror = null;",
+              "    childWorker.terminate();",
+              "    childWorker = null;",
+              "  }",
+              "}",
+              "function report(payload) {",
+              "  cleanupChild();",
+              "  self.postMessage(payload);",
+              "}",
+              "self.onmessage = function (event) {",
+              "  const childUrl = event.data && event.data.childUrl;",
+              "  if (!childUrl) {",
+              "    report({",
+              "      kind: parentKind,",
+              "      childModuleExecuted: false,",
+              "      nestedModuleWorkerPassed: false,",
+              '      error: "Child Module Worker URL was not received"',
+              "    });",
+              "    return;",
+              "  }",
+              "  try {",
+              '    childWorker = new Worker(childUrl, { type: "module" });',
+              "    childWorker.onmessage = function (childEvent) {",
+              "      const childPassed = !!childEvent.data &&",
+              '        childEvent.data.kind === "uwa-nested-module-child";',
+              "      report({",
+              "        kind: parentKind,",
+              "        childKind: childEvent.data && childEvent.data.kind,",
+              "        childModuleExecuted: childPassed,",
+              "        nestedModuleWorkerPassed: childPassed,",
+              "        error: childPassed ? null : " +
+                '"Child Module Worker returned unexpected data"',
+              "      });",
+              "    };",
+              "    childWorker.onerror = function (childError) {",
+              "      report({",
+              "        kind: parentKind,",
+              "        childModuleExecuted: false,",
+              "        nestedModuleWorkerPassed: false,",
+              "        error: childError && childError.message ?",
+              '          childError.message : "Child Module Worker execution failed"',
+              "      });",
+              "    };",
+              "    childWorker.onmessageerror = function () {",
+              "      report({",
+              "        kind: parentKind,",
+              "        childModuleExecuted: false,",
+              "        nestedModuleWorkerPassed: false,",
+              '        error: "Child Module Worker message could not be deserialized"',
+              "      });",
+              "    };",
+              "    childTimeoutId = setTimeout(function () {",
+              "      report({",
+              "        kind: parentKind,",
+              "        childModuleExecuted: false,",
+              "        nestedModuleWorkerPassed: false,",
+              "        timedOut: true,",
+              '        error: "Child Module Worker test timed out; keep the page in the foreground and retry"',
+              "      });",
+              "    }, 8500);",
+              "  } catch (error) {",
+              "    report({",
+              "      kind: parentKind,",
+              "      childModuleExecuted: false,",
+              "      nestedModuleWorkerPassed: false,",
+              "      error: error && error.message ? error.message : String(error)",
+              "    });",
+              "  }",
+              "};"
+            ].join("\n");
+            parentObjectUrl = URL.createObjectURL(
+              new Blob([parentSource], { type: "text/javascript" })
+            );
+            worker = new Worker(parentObjectUrl, { type: "module" });
+            worker.onmessage = function (event) {
+              var payload = event.data || {};
+              var topLevelPassed = payload.kind === "uwa-module-parent";
+              var nestedPassed =
+                topLevelPassed &&
+                payload.childModuleExecuted === true &&
+                payload.nestedModuleWorkerPassed === true &&
+                payload.childKind === "uwa-nested-module-child";
+              finish({
+                supported: nestedPassed,
+                topLevelModuleExecuted: topLevelPassed,
+                childModuleExecuted: payload.childModuleExecuted === true,
+                nestedModuleWorkerPassed: nestedPassed,
+                timedOut: payload.timedOut === true,
+                parentReport: payload,
+                error: nestedPassed ? null : {
+                  name: "ProtocolError",
+                  message: payload.error || "Nested Module Worker validation failed"
+                }
+              });
+            };
+            worker.onerror = function (event) {
+              if (event && typeof event.preventDefault === "function") event.preventDefault();
+              finish({
+                supported: false,
+                topLevelModuleExecuted: false,
+                childModuleExecuted: false,
+                nestedModuleWorkerPassed: false,
+                error: {
+                  name: "WorkerError",
+                  message: event && event.message ?
+                    event.message : "Top-level Module Worker execution failed"
+                }
+              });
+            };
+            worker.onmessageerror = function () {
+              finish({
+                supported: false,
+                topLevelModuleExecuted: false,
+                childModuleExecuted: false,
+                nestedModuleWorkerPassed: false,
+                error: {
+                  name: "MessageError",
+                  message: "Top-level Module Worker message could not be deserialized"
+                }
+              });
+            };
+            timeoutId = setTimeout(function () {
+              finish({
+                supported: false,
+                topLevelModuleExecuted: false,
+                childModuleExecuted: false,
+                nestedModuleWorkerPassed: false,
+                timedOut: true,
+                error: {
+                  name: "TimeoutError",
+                  message: "Nested Module Worker test timed out after 10 seconds; keep the page in the foreground and retry on mobile or when background throttling is active"
+                }
+              });
+            }, WORKER_TIMEOUT_MS);
+            worker.postMessage({ childUrl: childObjectUrl });
+          } catch (error) {
+            finish({
+              supported: false,
+              topLevelModuleExecuted: false,
+              childModuleExecuted: false,
+              nestedModuleWorkerPassed: false,
+              error: serializeError(error)
+            });
+          }
+        });
+      }
+
+      function probeTransferableArrayBuffer() {
+        return new Promise(function (resolve) {
+          var startedAt = nowMs();
+          var worker = null;
+          var objectUrl = null;
+          var timeoutId = null;
+          var finished = false;
+          var senderDetached = false;
+
+          function finish(payload) {
+            if (finished) return;
+            finished = true;
+            if (timeoutId !== null) clearTimeout(timeoutId);
+            if (worker) {
+              worker.onmessage = null;
+              worker.onerror = null;
+              worker.onmessageerror = null;
+              worker.terminate();
+            }
+            if (objectUrl) URL.revokeObjectURL(objectUrl);
+            payload.senderDetached = senderDetached;
+            payload.elapsedMs = roundMs(nowMs() - startedAt);
+            resolve(payload);
+          }
+
+          if (!workerPrerequisites() || typeof ArrayBuffer !== "function") {
+            finish({
+              supported: false,
+              roundTripPassed: false,
+              error: {
+                name: "UnsupportedError",
+                message: "Worker/Blob URL/ArrayBuffer APIs are incomplete"
+              }
+            });
+            return;
+          }
+
+          try {
+            var source = [
+              '"use strict";',
+              "self.onmessage = function (event) {",
+              "  var buffer = event.data.buffer;",
+              "  var bytes = new Uint8Array(buffer);",
+              "  bytes[0] = (bytes[0] + 1) & 255;",
+              "  self.postMessage({ buffer: buffer, length: buffer.byteLength }, [buffer]);",
+              "};"
+            ].join("\n");
+            objectUrl = URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
+            worker = new Worker(objectUrl);
+            worker.onmessage = function (event) {
+              var returned = event.data && event.data.buffer;
+              var isBuffer = Object.prototype.toString.call(returned) === "[object ArrayBuffer]";
+              var returnedLength = isBuffer ? returned.byteLength : 0;
+              var returnedValue = isBuffer && returnedLength ? new Uint8Array(returned)[0] : null;
+              var roundTripPassed =
+                isBuffer &&
+                returnedLength === 8 &&
+                event.data.length === 8 &&
+                returnedValue === 42;
+              finish({
+                supported: senderDetached && roundTripPassed,
+                roundTripPassed: roundTripPassed,
+                returnedByteLength: returnedLength,
+                returnedFirstByte: returnedValue,
+                error: senderDetached && roundTripPassed ? null : {
+                  name: "TransferError",
+                  message: "The sender was not detached, or the returned ArrayBuffer data was incorrect"
+                }
+              });
+            };
+            worker.onerror = function (event) {
+              if (event && typeof event.preventDefault === "function") event.preventDefault();
+              finish({
+                supported: false,
+                roundTripPassed: false,
+                error: {
+                  name: "WorkerError",
+                  message: event && event.message ? event.message : "Transfer Worker execution failed"
+                }
+              });
+            };
+            worker.onmessageerror = function () {
+              finish({
+                supported: false,
+                roundTripPassed: false,
+                error: { name: "MessageError", message: "Transfer Worker message could not be deserialized" }
+              });
+            };
+            timeoutId = setTimeout(function () {
+              finish({
+                supported: false,
+                roundTripPassed: false,
+                timedOut: true,
+                error: {
+                  name: "TimeoutError",
+                  message: "ArrayBuffer transfer test timed out after 10 seconds; keep the page in the foreground and retry on mobile or when background throttling is active"
+                }
+              });
+            }, WORKER_TIMEOUT_MS);
+
+            var buffer = new ArrayBuffer(8);
+            new Uint8Array(buffer)[0] = 41;
+            worker.postMessage({ buffer: buffer }, [buffer]);
+            senderDetached = buffer.byteLength === 0;
+          } catch (error) {
+            finish({
+              supported: false,
+              roundTripPassed: false,
+              error: serializeError(error)
+            });
+          }
+        });
+      }
+
+      function probeFileReader() {
+        return new Promise(function (resolve) {
+          if (typeof FileReader !== "function" || typeof Blob !== "function") {
+            resolve({
+              passed: false,
+              error: { name: "UnsupportedError", message: "FileReader or Blob is unavailable" }
+            });
+            return;
+          }
+
+          var reader = new FileReader();
+          var timeoutId = null;
+          var finished = false;
+
+          function finish(payload) {
+            if (finished) return;
+            finished = true;
+            if (timeoutId !== null) clearTimeout(timeoutId);
+            reader.onload = null;
+            reader.onerror = null;
+            reader.onabort = null;
+            resolve(payload);
+          }
+
+          reader.onload = function () {
+            var buffer = reader.result;
+            var passed =
+              Object.prototype.toString.call(buffer) === "[object ArrayBuffer]" &&
+              buffer.byteLength === 3 &&
+              new Uint8Array(buffer)[2] === 3;
+            finish({
+              passed: passed,
+              bytesRead: buffer && typeof buffer.byteLength === "number" ? buffer.byteLength : null,
+              error: passed ? null : {
+                name: "ReadError",
+                message: "FileReader returned incorrect data"
+              }
+            });
+          };
+          reader.onerror = function () {
+            finish({
+              passed: false,
+              error: serializeError(reader.error || new Error("FileReader read failed"))
+            });
+          };
+          reader.onabort = function () {
+            finish({
+              passed: false,
+              error: { name: "AbortError", message: "FileReader read was aborted" }
+            });
+          };
+          timeoutId = setTimeout(function () {
+            try {
+              if (reader.readyState === FileReader.LOADING) reader.abort();
+            } catch (error) {
+              // finish below still resolves the probe.
+            }
+            finish({
+              passed: false,
+              timedOut: true,
+              error: { name: "TimeoutError", message: "FileReader test timed out" }
+            });
+          }, FILE_READER_TIMEOUT_MS);
+
+          try {
+            reader.readAsArrayBuffer(new Blob([
+              new Uint8Array([1, 2, 3])
+            ], { type: "application/octet-stream" }));
+          } catch (error) {
+            finish({ passed: false, error: serializeError(error) });
+          }
+        });
+      }
+
+      async function probeBasicApis() {
+        var details = {
+          arrayBufferAndTypedArrays: false,
+          dataView: false,
+          textDecoder: false,
+          file: typeof File === "function",
+          fileReader: false,
+          blob: typeof Blob === "function",
+          promise: typeof Promise === "function",
+          performance: typeof performance !== "undefined" &&
+            typeof performance.now === "function"
+        };
+        var errors = {};
+
+        try {
+          var buffer = new ArrayBuffer(16);
+          var u8 = new Uint8Array(buffer);
+          var u32 = new Uint32Array(buffer);
+          var i32 = new Int32Array(buffer);
+          var f32 = new Float32Array(buffer);
+          u8[0] = 7;
+          details.arrayBufferAndTypedArrays =
+            buffer.byteLength === 16 &&
+            u8.length === 16 &&
+            u32.length === 4 &&
+            i32.length === 4 &&
+            f32.length === 4;
+        } catch (error) {
+          errors.arrayBufferAndTypedArrays = serializeError(error);
+        }
+
+        try {
+          var viewBuffer = new ArrayBuffer(4);
+          var view = new DataView(viewBuffer);
+          view.setUint32(0, 0x12345678, true);
+          details.dataView = view.getUint32(0, true) === 0x12345678;
+        } catch (error) {
+          errors.dataView = serializeError(error);
+        }
+
+        try {
+          var decoder = new TextDecoder("utf-8");
+          details.textDecoder =
+            decoder.decode(new Uint8Array([0x55, 0x57, 0x41])) === "UWA";
+        } catch (error) {
+          errors.textDecoder = serializeError(error);
+        }
+
+        var fileReaderResult = await probeFileReader();
+        details.fileReader = !!fileReaderResult.passed;
+        if (fileReaderResult.error) errors.fileReader = fileReaderResult.error;
+
+        var missing = [];
+        Object.keys(details).forEach(function (key) {
+          if (!details[key]) missing.push(key);
+        });
+        return {
+          supported: missing.length === 0,
+          details: details,
+          missing: missing,
+          fileReaderTest: fileReaderResult,
+          errors: errors
+        };
+      }
+
+      async function guardedProbe(diagnostics, scope, probe) {
+        try {
+          return await probe();
+        } catch (error) {
+          var serialized = serializeError(error);
+          diagnostics.push({ scope: scope, error: serialized });
+          return {
+            supported: false,
+            error: serialized
+          };
+        }
+      }
+
+      function collectEnvironment() {
+        var protocol = window.location && window.location.protocol ?
+          window.location.protocol : "unknown:";
+        var httpLike = protocol === "http:" || protocol === "https:";
+        var optional = {
+          webgpu: !!(navigator && navigator.gpu),
+          webcodecs: typeof VideoDecoder === "function" || typeof ImageDecoder === "function",
+          videoDecoder: typeof VideoDecoder === "function",
+          imageDecoder: typeof ImageDecoder === "function",
+          offscreenCanvas: typeof OffscreenCanvas === "function"
+        };
+
+        return {
+          timestamp: new Date().toISOString(),
+          userAgent: navigator.userAgent || null,
+          platform: navigator.platform || null,
+          language: navigator.language || null,
+          serving: {
+            protocol: protocol,
+            httpOrHttps: httpLike,
+            hostname: window.location && window.location.hostname ?
+              window.location.hostname : null,
+            secureContext: typeof window.isSecureContext === "boolean" ?
+              window.isSecureContext : null
+          },
+          isolation: {
+            crossOriginIsolated: typeof self.crossOriginIsolated === "boolean" ?
+              self.crossOriginIsolated : false,
+            sharedArrayBufferAvailable: typeof SharedArrayBuffer === "function",
+            requiredByCurrentProject: false
+          },
+          device: {
+            hardwareConcurrency: navigator.hardwareConcurrency || null,
+            deviceMemoryGiB: navigator.deviceMemory || null,
+            maxTouchPoints: navigator.maxTouchPoints || 0,
+            devicePixelRatio: window.devicePixelRatio || 1,
+            screen: {
+              width: typeof screen !== "undefined" ? screen.width : null,
+              height: typeof screen !== "undefined" ? screen.height : null,
+              availableWidth: typeof screen !== "undefined" ? screen.availWidth : null,
+              availableHeight: typeof screen !== "undefined" ? screen.availHeight : null
+            }
+          },
+          optional: optional,
+          privacy: {
+            uploaded: false,
+            note: "Results are generated locally; browser privacy policies may hide or generalize GPU identifiers."
+          }
+        };
+      }
+
+      function formatValue(value, fallback) {
+        if (value === null || typeof value === "undefined" || value === "") {
+          return fallback || "Unknown";
+        }
+        return String(value);
+      }
+
+      function buildChecks(result) {
+        var webgl = result.capabilities.webgl;
+        var limits = webgl.limits || {};
+        var shader = webgl.shaderSmokeTest || {};
+        var astc = webgl.astc || {};
+        var supplemental = webgl.supplemental || {};
+        var identity = webgl.identity || {};
+        var wasm = result.capabilities.wasm;
+        var workers = result.capabilities.workers;
+        var apis = result.capabilities.basicApis;
+        var environment = result.environment;
+        var checks = [];
+
+        function add(id, group, name, status, explanation, gate, passed) {
+          checks.push({
+            id: id,
+            group: group,
+            name: name,
+            status: status,
+            explanation: explanation,
+            gate: gate || "none",
+            passed: typeof passed === "boolean" ? passed : null
+          });
+        }
+
+        var webgl2Passed = !!webgl.webgl2Available && !webgl.contextLost;
+        var webglExplanation;
+        if (webgl2Passed) {
+          webglExplanation = "Created a WebGL2 context; WebGL1 is not a fallback path for this project.";
+        } else if (webgl.webgl1 && webgl.webgl1.available) {
+          webglExplanation = "Only WebGL1 was detected; this project requires GLSL ES 3.00, integer textures, and array textures, which WebGL1 cannot provide.";
+        } else {
+          webglExplanation = "Could not create a usable WebGL2 context.";
+        }
+        add(
+          "webgl2",
+          "core",
+          "WebGL2 context",
+          webgl2Passed ? "pass" : "unsupported",
+          webglExplanation,
+          "hard",
+          webgl2Passed
+        );
+
+        var shaderPassed = webgl2Passed && !!shader.passed;
+        add(
+          "project-shader",
+          "core",
+          "Project shader smoke test",
+          shaderPassed ? "pass" : "unsupported",
+          shaderPassed ?
+            "GLSL ES 3.00 compilation/linking and the 1×1 functional draw readback passed, covering RGBA32UI, uint vertex attributes, usampler2D, and sampler2DArray." :
+            (webgl2Passed ?
+              "The project feature shader did not complete compilation, linking, or functional draw readback; inspect the log and pixel values in the JSON." :
+              "WebGL2 was unavailable, so the project feature shader test could not run."),
+          "hard",
+          shaderPassed
+        );
+
+        var apiNameMap = {
+          arrayBufferAndTypedArrays: "ArrayBuffer/TypedArray",
+          dataView: "DataView",
+          textDecoder: "TextDecoder",
+          file: "File",
+          fileReader: "FileReader",
+          blob: "Blob",
+          promise: "Promise",
+          performance: "performance.now"
+        };
+        var missingApiNames = (apis.missing || []).map(function (key) {
+          return apiNameMap[key] || key;
+        });
+        add(
+          "basic-apis",
+          "core",
+          "File and binary baseline APIs",
+          apis.supported ? "pass" : "unsupported",
+          apis.supported ?
+            "Functional tests passed for ArrayBuffer/TypedArray, DataView, TextDecoder, File/FileReader, Promise, and performance." :
+            "Missing or failed tests: " + (missingApiNames.join(", ") || "Unknown API") + ".",
+          "hard",
+          !!apis.supported
+        );
+
+        var limitsPassed = webgl2Passed && !!limits.requirementsPassed;
+        add(
+          "gpu-limits",
+          "gpu",
+          "GPU texture limits",
+          limitsPassed ? "pass" : "unsupported",
+          webgl2Passed ?
+            "MAX_TEXTURE_SIZE=" + formatValue(limits.maxTextureSize) +
+              " (requires ≥4096), vertex texture units=" +
+              formatValue(limits.maxVertexTextureImageUnits) +
+              " (requires >0), array texture layers=" +
+              formatValue(limits.maxArrayTextureLayers) +
+              "; actual model limits still depend on model size and memory." :
+            "WebGL2 was unavailable, so the GPU limits required by this project could not be queried.",
+          "hard",
+          limitsPassed
+        );
+
+        var astcPassed = webgl2Passed && !!astc.extensionSupported && !!astc.uploadPassed;
+        var astcExplanation;
+        if (astcPassed) {
+          astcExplanation = "The ASTC extension is present, and the 16-byte compressed upload test for a 4×4×1 TEXTURE_2D_ARRAY passed.";
+        } else if (astc.extensionSupported) {
+          astcExplanation = "The extension was reported, but the ASTC array texture upload failed; the CPU/WASM fallback will be used, and the GPU texture path and its memory advantages are unavailable.";
+        } else {
+          astcExplanation = "ASTC was not detected; the project can use the CPU/WASM fallback, but the GPU texture path and its memory/performance advantages are unavailable.";
+        }
+        add(
+          "astc",
+          "gpu",
+          "Recommended ASTC acceleration",
+          astcPassed ? "pass" : "warn",
+          astcExplanation,
+          "recommended",
+          astcPassed
+        );
+
+        add(
+          "float-textures",
+          "gpu",
+          "Floating-point textures and color buffers",
+          "info",
+          webgl2Passed ?
+            "Floating-point and half-float sampling are core WebGL2 features; linear filtering=" +
+              (supplemental.floatTextureLinearFiltering ? "available" : "not reported") +
+              ", EXT_color_buffer_float=" +
+              (supplemental.colorBufferFloat ? "available" : "not reported") +
+              ". These are not hard requirements for this project." :
+            "WebGL2 was unavailable; this is supplementary information and is not a standalone requirement.",
+          "none",
+          null
+        );
+
+        add(
+          "anisotropy",
+          "gpu",
+          "Anisotropic filtering",
+          "info",
+          supplemental.anisotropy ?
+            "Extension available; maximum anisotropy=" + formatValue(supplemental.maxAnisotropy) + "; not a hard requirement for this project." :
+            "Extension not reported; not a hard requirement for this project.",
+          "none",
+          null
+        );
+
+        add(
+          "gpu-identity",
+          "gpu",
+          "GPU identifiers",
+          "info",
+          "Vendor=" + formatValue(identity.vendor) +
+            "; Renderer=" + formatValue(identity.renderer) +
+            ". Displayed locally only; browser privacy policies may hide or generalize these values.",
+          "none",
+          null
+        );
+
+        add(
+          "wasm-basic",
+          "runtime",
+          "WebAssembly baseline capability",
+          wasm.basic.supported ? "pass" : "unsupported",
+          wasm.basic.supported ?
+            "Validation and instantiation both passed for a minimal WASM module." :
+            "A minimal WASM module could not complete validation/instantiation.",
+          "hard",
+          !!wasm.basic.supported
+        );
+
+        add(
+          "wasm-simd",
+          "runtime",
+          "WASM SIMD128",
+          wasm.simd128.supported ? "pass" : "unsupported",
+          wasm.simd128.supported ?
+            "Browser SIMD128 instruction support passed validation and instantiation with a minimal module; the published UWA artifacts, JS glue, and memory configuration were not executed." :
+            "The browser failed the SIMD128 instruction test, so the current -msimd128 UWA build cannot run; rebuild UWA with --disable-simd. The sorter has a separate non-SIMD fallback.",
+          "hard",
+          !!wasm.simd128.supported
+        );
+
+        add(
+          "classic-worker",
+          "runtime",
+          "Dedicated / Classic Blob Worker",
+          workers.classic.supported ? "pass" : "unsupported",
+          workers.classic.supported ?
+            "Classic Blob Worker creation and message round-trip succeeded, matching the sorter Worker path." :
+            (workers.classic.timedOut ?
+              "Classic Worker timed out after 10 seconds; mobile or background throttling may cause a false result, so keep the page in the foreground and retry." :
+              "Classic Blob Worker did not complete the functional test."),
+          "hard",
+          !!workers.classic.supported
+        );
+
+        var nestedModuleWorkerPassed =
+          !!workers.module.nestedModuleWorkerPassed;
+        add(
+          "module-worker",
+          "runtime",
+          "Nested Module Worker",
+          nestedModuleWorkerPassed ? "pass" : "unsupported",
+          nestedModuleWorkerPassed ?
+            "The top-level Module Worker created and validated a child Module Worker, matching the actual topology in which the UWA coordinator creates shard workers." :
+            (workers.module.timedOut ?
+              "Nested Module Worker timed out after 10 seconds; mobile or background throttling may cause a false result, so keep the page in the foreground and retry." :
+              "The top-level Module Worker could not create and validate a child Module Worker; the current UWA coordinator/shard topology depends on this capability."),
+          "hard",
+          nestedModuleWorkerPassed
+        );
+
+        add(
+          "transferable-arraybuffer",
+          "runtime",
+          "Transferable ArrayBuffer",
+          workers.transferableArrayBuffer.supported ? "pass" : "unsupported",
+          workers.transferableArrayBuffer.supported ?
+            "After sending with a transfer list, the main-thread buffer was detached and the Worker successfully modified and transferred it back." :
+            (workers.transferableArrayBuffer.timedOut ?
+              "ArrayBuffer transfer timed out after 10 seconds; mobile or background throttling may cause a false result, so keep the page in the foreground and retry." :
+              "Sender detachment or Worker round-trip validation failed; the loader, shards, and coordinator depend on transfer lists."),
+          "hard",
+          !!workers.transferableArrayBuffer.supported
+        );
+
+        var serving = environment.serving;
+        add(
+          "serving",
+          "environment",
+          "Page access method",
+          serving.httpOrHttps ? "pass" : "warn",
+          serving.httpOrHttps ?
+            "Currently accessed over " + serving.protocol + ", matching the actual loading method for project resources and Module Workers." :
+            "Currently accessed over " + serving.protocol +
+              "; this does not mark browser capability as failed. Serve the production project from an HTTP/HTTPS web server and retest.",
+          "environment",
+          serving.httpOrHttps
+        );
+
+        var isolation = environment.isolation;
+        add(
+          "isolation",
+          "environment",
+          "Cross-origin isolation / SharedArrayBuffer",
+          "info",
+          "crossOriginIsolated=" + String(isolation.crossOriginIsolated) +
+            ", SharedArrayBuffer=" +
+            (isolation.sharedArrayBufferAvailable ? "available" : "unavailable") +
+            "; the project does not require SAB or COOP/COEP, so this is not a requirement.",
+          "none",
+          null
+        );
+
+        var optional = environment.optional;
+        add(
+          "optional-apis",
+          "environment",
+          "Optional newer APIs",
+          "info",
+          "WebGPU=" + (optional.webgpu ? "available" : "unavailable") +
+            ", WebCodecs=" + (optional.webcodecs ? "available" : "unavailable") +
+            ", OffscreenCanvas=" + (optional.offscreenCanvas ? "available" : "unavailable") +
+            "; none are project requirements.",
+          "none",
+          null
+        );
+
+        var device = environment.device;
+        add(
+          "device-info",
+          "environment",
+          "Device hints",
+          "info",
+          "hardwareConcurrency=" + formatValue(device.hardwareConcurrency) +
+            ", deviceMemory=" +
+            (device.deviceMemoryGiB ? device.deviceMemoryGiB + " GiB" : "not reported") +
+            ", DPR=" + formatValue(device.devicePixelRatio) +
+            "; these values are not correctness requirements.",
+          "none",
+          null
+        );
+
+        return checks;
+      }
+
+      function computeVerdict(checks) {
+        var hardFailures = checks.filter(function (check) {
+          return check.gate === "hard" && check.passed === false;
+        });
+        var accelerationWarnings = checks.filter(function (check) {
+          return check.gate === "recommended" && check.passed === false;
+        });
+        var environmentWarnings = checks.filter(function (check) {
+          return check.gate === "environment" && check.passed === false;
+        });
+        var code;
+        var label;
+
+        var warningKind = null;
+        if (hardFailures.length) {
+          code = "fail";
+          label = "Does not meet current build requirements";
+        } else if (accelerationWarnings.length || environmentWarnings.length) {
+          code = "warning";
+          label = accelerationWarnings.length ?
+            "Runnable without recommended acceleration" :
+            "Meets the project's core environment requirements";
+          if (accelerationWarnings.length && environmentWarnings.length) {
+            warningKind = "acceleration-and-environment";
+          } else if (accelerationWarnings.length) {
+            warningKind = "acceleration";
+          } else {
+            warningKind = "environment";
+          }
+        } else {
+          code = "pass";
+          label = "Meets the project's core environment requirements";
+        }
+
+        return {
+          code: code,
+          label: label,
+          warningKind: warningKind,
+          hardFailures: hardFailures.map(function (check) {
+            return {
+              id: check.id,
+              name: check.name,
+              explanation: check.explanation
+            };
+          }),
+          accelerationWarnings: accelerationWarnings.map(function (check) {
+            return {
+              id: check.id,
+              name: check.name,
+              explanation: check.explanation
+            };
+          }),
+          environmentWarnings: environmentWarnings.map(function (check) {
+            return {
+              id: check.id,
+              name: check.name,
+              explanation: check.explanation
+            };
+          })
+        };
+      }
+
+      function verdictReasonLines(result) {
+        var verdict = result.verdict;
+        var lines = [];
+        if (verdict.code === "fail") {
+          verdict.hardFailures.slice(0, 4).forEach(function (failure) {
+            lines.push(failure.name + ": " + failure.explanation);
+          });
+          if (verdict.hardFailures.length > 4) {
+            lines.push("Another " + (verdict.hardFailures.length - 4) + " core tests failed.");
+          }
+        } else if (verdict.code === "warning") {
+          lines.push("Core WebGL2, project shader, WASM SIMD, Worker, and transfer-list tests all passed.");
+          verdict.accelerationWarnings.forEach(function (warning) {
+            lines.push("Recommended acceleration: " + warning.explanation);
+          });
+          if (!verdict.accelerationWarnings.length) {
+            lines.push("The recommended ASTC acceleration test passed.");
+          }
+        } else {
+          lines.push("WebGL2, project shader, GPU limit, WASM SIMD, Worker, and transfer-list tests all passed.");
+          lines.push("The ASTC array texture functional upload test passed.");
+        }
+
+        verdict.environmentWarnings.forEach(function (warning) {
+          lines.push("Access environment: " + warning.explanation);
+        });
+        return lines;
+      }
+
+      function renderChecks(checks) {
+        Object.keys(groupElements).forEach(function (group) {
+          var container = groupElements[group];
+          container.textContent = "";
+          var groupChecks = checks.filter(function (check) {
+            return check.group === group;
+          });
+          groupChecks.forEach(function (check) {
+            var row = document.createElement("div");
+            row.className = "check-row";
+
+            var content = document.createElement("div");
+            var name = document.createElement("div");
+            name.className = "check-name";
+            name.textContent = check.name;
+            var explanation = document.createElement("p");
+            explanation.className = "check-explanation";
+            explanation.textContent = check.explanation;
+            content.appendChild(name);
+            content.appendChild(explanation);
+
+            var status = document.createElement("span");
+            status.className = "status status-" + check.status;
+            status.textContent = STATUS_LABELS[check.status] || check.status;
+
+            row.appendChild(content);
+            row.appendChild(status);
+            container.appendChild(row);
+          });
+        });
+      }
+
+      function renderResult(result) {
+        verdictCard.className = "card verdict is-" + result.verdict.code;
+        verdictTitle.textContent = result.verdict.label;
+        verdictReasons.textContent = "";
+        verdictReasonLines(result).forEach(function (line) {
+          var item = document.createElement("li");
+          item.textContent = line;
+          verdictReasons.appendChild(item);
+        });
+        verdictMeta.textContent =
+          "Completed at " + new Date(result.finishedAt).toLocaleString() +
+          " | Duration " + result.durationMs + " ms | Probe " + result.probeVersion;
+        renderChecks(result.checks);
+        rawJson.textContent = JSON.stringify(result, null, 2);
+      }
+
+      function setRunningUi() {
+        currentResult = null;
+        verdictCard.className = "card verdict is-running";
+        verdictTitle.textContent = "Testing";
+        verdictReasons.textContent = "";
+        var item = document.createElement("li");
+        item.textContent = "Running WebGL, WASM, and Worker functional tests. Please wait.";
+        verdictReasons.appendChild(item);
+        verdictMeta.textContent = "All tests run locally";
+        rawJson.textContent = "Testing…";
+        Object.keys(groupElements).forEach(function (group) {
+          groupElements[group].textContent = "";
+          var loading = document.createElement("div");
+          loading.className = "loading-row";
+          loading.textContent = "Testing";
+          groupElements[group].appendChild(loading);
+        });
+        rerunButton.disabled = true;
+        copySummaryButton.disabled = true;
+        copyJsonButton.disabled = true;
+        showFeedback("", "");
+      }
+
+      function showFeedback(message, kind) {
+        if (feedbackTimer !== null) {
+          clearTimeout(feedbackTimer);
+          feedbackTimer = null;
+        }
+        feedback.textContent = message || "";
+        feedback.className = "feedback" + (kind ? " is-" + kind : "");
+        if (message) {
+          feedbackTimer = setTimeout(function () {
+            feedback.textContent = "";
+            feedback.className = "feedback";
+            feedbackTimer = null;
+          }, 3500);
+        }
+      }
+
+      function formatSummary(result) {
+        var webgl = result.capabilities.webgl;
+        var limits = webgl.limits || {};
+        var astc = webgl.astc || {};
+        var lines = [
+          "UWA Browser Capability Probe",
+          "Result: " + result.verdict.label,
+          "Time: " + result.finishedAt,
+          "Probe version: " + result.probeVersion
+        ];
+
+        if (result.verdict.hardFailures.length) {
+          lines.push("Core failures: " + result.verdict.hardFailures.map(function (failure) {
+            return failure.name;
+          }).join(", "));
+        } else {
+          lines.push("Core failures: none");
+        }
+
+        lines.push(
+          "WebGL2: " + (webgl.webgl2Available && !webgl.contextLost ? "Pass" : "Fail"),
+          "MAX_TEXTURE_SIZE: " + formatValue(limits.maxTextureSize),
+          "MAX_VERTEX_TEXTURE_IMAGE_UNITS: " + formatValue(limits.maxVertexTextureImageUnits),
+          "MAX_ARRAY_TEXTURE_LAYERS: " + formatValue(limits.maxArrayTextureLayers),
+          "ASTC array texture upload: " + (astc.uploadPassed ? "Pass" : "Unavailable/failed"),
+          "WASM SIMD128: " +
+            (result.capabilities.wasm.simd128.supported ? "Pass" : "Fail"),
+          "SIMD test scope: validates only a minimal SIMD128 instruction module; it does not execute the published UWA artifacts, glue, or memory configuration",
+          "Classic Worker: " +
+            (result.capabilities.workers.classic.supported ? "Pass" : "Fail"),
+          "Nested Module Worker: " +
+            (result.capabilities.workers.module.nestedModuleWorkerPassed ? "Pass" : "Fail"),
+          "ArrayBuffer transfer: " +
+            (result.capabilities.workers.transferableArrayBuffer.supported ? "Pass" : "Fail"),
+          "Access protocol: " + result.environment.serving.protocol,
+          "crossOriginIsolated: " + result.environment.isolation.crossOriginIsolated +
+            " (not required by this project)",
+          "User-Agent: " + formatValue(result.environment.userAgent),
+          "Note: results are generated locally and are not uploaded."
+        );
+        return lines.join("\n");
+      }
+
+      async function copyText(text) {
+        if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+          try {
+            await navigator.clipboard.writeText(text);
+            return;
+          } catch (error) {
+            // Fall through to the selection-based copy path.
+          }
+        }
+
+        var textarea = document.createElement("textarea");
+        textarea.value = text;
+        textarea.setAttribute("readonly", "");
+        textarea.style.position = "fixed";
+        textarea.style.left = "-9999px";
+        textarea.style.top = "0";
+        textarea.style.opacity = "0";
+        document.body.appendChild(textarea);
+        textarea.focus();
+        textarea.select();
+        textarea.setSelectionRange(0, textarea.value.length);
+        var copied = false;
+        try {
+          copied = document.execCommand("copy");
+        } finally {
+          document.body.removeChild(textarea);
+        }
+        if (!copied) throw new Error("The browser denied the copy operation; select the JSON content manually.");
+      }
+
+      async function runProbe() {
+        var sequence = ++runSequence;
+        setRunningUi();
+        var startedAt = nowMs();
+        var startedIso = new Date().toISOString();
+        var diagnostics = [];
+        var environment = collectEnvironment();
+
+        var webgl = await guardedProbe(diagnostics, "webgl", probeWebGL);
+        var parallelResults = await Promise.all([
+          guardedProbe(diagnostics, "basic-apis", probeBasicApis),
+          guardedProbe(diagnostics, "wasm-basic", probeWasmBasic),
+          guardedProbe(diagnostics, "wasm-simd128", probeWasmSimd),
+          guardedProbe(diagnostics, "classic-worker", probeClassicWorker),
+          guardedProbe(diagnostics, "module-worker", probeModuleWorker),
+          guardedProbe(diagnostics, "transferable-arraybuffer", probeTransferableArrayBuffer)
+        ]);
+
+        if (sequence !== runSequence) return;
+
+        var result = {
+          schemaVersion: 1,
+          probeVersion: PROBE_VERSION,
+          startedAt: startedIso,
+          finishedAt: new Date().toISOString(),
+          durationMs: roundMs(nowMs() - startedAt),
+          verdict: null,
+          environment: environment,
+          capabilities: {
+            webgl: webgl,
+            basicApis: parallelResults[0],
+            wasm: {
+              basic: parallelResults[1],
+              simd128: parallelResults[2],
+              currentUwaArtifactsRequireSimd128: true,
+              nonSimdUwaRebuildAvailable: true,
+              sorterHasNonSimdFallback: true
+            },
+            workers: {
+              classic: parallelResults[3],
+              module: parallelResults[4],
+              transferableArrayBuffer: parallelResults[5]
+            }
+          },
+          checks: [],
+          diagnostics: diagnostics
+        };
+
+        result.checks = buildChecks(result);
+        result.verdict = computeVerdict(result.checks);
+        currentResult = result;
+        renderResult(result);
+        rerunButton.disabled = false;
+        copySummaryButton.disabled = false;
+        copyJsonButton.disabled = false;
+      }
+
+      function renderFatalError(error) {
+        var serialized = serializeError(error);
+        var result = {
+          schemaVersion: 1,
+          probeVersion: PROBE_VERSION,
+          startedAt: new Date().toISOString(),
+          finishedAt: new Date().toISOString(),
+          durationMs: 0,
+          verdict: {
+            code: "fail",
+            label: "Does not meet current build requirements",
+            hardFailures: [{
+              id: "probe-fatal",
+              name: "Probe script",
+              explanation: "The probe script encountered an unhandled error: " + errorMessage(error)
+            }],
+            accelerationWarnings: [],
+            environmentWarnings: []
+          },
+          environment: collectEnvironment(),
+          capabilities: {},
+          checks: [{
+            id: "probe-fatal",
+            group: "core",
+            name: "Probe script",
+            status: "unsupported",
+            explanation: "The probe script encountered an unhandled error: " + errorMessage(error),
+            gate: "hard",
+            passed: false
+          }],
+          diagnostics: [{ scope: "fatal", error: serialized }]
+        };
+        currentResult = result;
+        verdictCard.className = "card verdict is-fail";
+        verdictTitle.textContent = result.verdict.label;
+        verdictReasons.textContent = "";
+        var item = document.createElement("li");
+        item.textContent = result.verdict.hardFailures[0].explanation;
+        verdictReasons.appendChild(item);
+        verdictMeta.textContent = "The probe did not complete";
+        Object.keys(groupElements).forEach(function (group) {
+          groupElements[group].textContent = "";
+        });
+        renderChecks(result.checks);
+        rawJson.textContent = JSON.stringify(result, null, 2);
+        rerunButton.disabled = false;
+        copySummaryButton.disabled = true;
+        copyJsonButton.disabled = false;
+      }
+
+      function startProbe() {
+        runProbe().catch(function (error) {
+          renderFatalError(error);
+        });
+      }
+
+      rerunButton.addEventListener("click", startProbe);
+      copySummaryButton.addEventListener("click", async function () {
+        if (!currentResult) return;
+        try {
+          await copyText(formatSummary(currentResult));
+          showFeedback("Summary copied.", "success");
+        } catch (error) {
+          showFeedback("Copy failed: " + errorMessage(error), "error");
+        }
+      });
+      copyJsonButton.addEventListener("click", async function () {
+        if (!currentResult) return;
+        try {
+          await copyText(JSON.stringify(currentResult, null, 2));
+          showFeedback("JSON copied.", "success");
+        } catch (error) {
+          showFeedback("Copy failed: " + errorMessage(error), "error");
+        }
+      });
+
+      startProbe();
+    })();
+  </script>
+</body>
+</html>

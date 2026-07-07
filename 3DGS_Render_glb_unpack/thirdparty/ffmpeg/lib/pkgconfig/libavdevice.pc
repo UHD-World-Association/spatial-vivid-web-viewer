@@ -1,0 +1,14 @@
+prefix=/d/GS/UWA/ffmpeg-wasm-install
+exec_prefix=${prefix}
+libdir=/d/GS/UWA/ffmpeg-wasm-install/lib
+includedir=/d/GS/UWA/ffmpeg-wasm-install/include
+
+Name: libavdevice
+Description: FFmpeg device handling library
+Version: 62.3.100
+Requires: libavformat >= 62.12.100, libavcodec >= 62.28.100, libavutil >= 60.26.100
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lavdevice -lm
+Libs.private: 
+Cflags: -I${includedir}

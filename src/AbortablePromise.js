@@ -31,37 +31,53 @@ export class AbortablePromise {
             promiseReject(error);
         };
 
-        promiseFunc(resolve.bind(this), reject.bind(this));
+        try {
+            promiseFunc(resolve.bind(this), reject.bind(this));
+        } catch (error) {
+            reject(error);
+        }
         this.abortHandler = abortHandler;
         this.id = AbortablePromise.idGen++;
     }
 
-    then(onResolve) {
+    then(onResolve, onReject) {
         return new AbortablePromise((resolve, reject) => {
-            this.promise = this.promise
-            .then((...args) => {
-                const onResolveResult = onResolve(...args);
-                if (onResolveResult instanceof Promise || onResolveResult instanceof AbortablePromise) {
-                    onResolveResult.then((...args2) => {
-                        resolve(...args2);
-                    });
+            const settleResult = (result) => {
+                if (result instanceof AbortablePromise) {
+                    result.promise.then(resolve, reject);
+                } else if (result instanceof Promise) {
+                    result.then(resolve, reject);
                 } else {
-                    resolve(onResolveResult);
+                    resolve(result);
                 }
-            })
-            .catch((error) => {
-                reject(error);
+            };
+
+            this.promise.then((value) => {
+                if (!onResolve) {
+                    resolve(value);
+                    return;
+                }
+                try {
+                    settleResult(onResolve(value));
+                } catch (error) {
+                    reject(error);
+                }
+            }, (error) => {
+                if (!onReject) {
+                    reject(error);
+                    return;
+                }
+                try {
+                    settleResult(onReject(error));
+                } catch (handlerError) {
+                    reject(handlerError);
+                }
             });
         }, this.abortHandler);
     }
 
     catch(onFail) {
-        return new AbortablePromise((resolve) => {
-            this.promise = this.promise.then((...args) => {
-                resolve(...args);
-            })
-            .catch(onFail);
-        }, this.abortHandler);
+        return this.then(undefined, onFail);
     }
 
     abort(reason) {

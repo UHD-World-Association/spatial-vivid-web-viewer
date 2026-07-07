@@ -1,0 +1,16 @@
+[submodule "3DGS_Render_glb_unpack/thirdparty/astc-encoder"]
+	path = 3DGS_Render_glb_unpack/thirdparty/astc-encoder
+	url = https://github.com/ARM-software/astc-encoder
+[submodule "3DGS_Render_glb_unpack/thirdparty/glm"]
+	path = 3DGS_Render_glb_unpack/thirdparty/glm
+	url = https://github.com/g-truc/glm.git
+[submodule "3DGS_Render_glb_unpack/thirdparty/zlib"]
+	path = 3DGS_Render_glb_unpack/thirdparty/zlib
+	url = https://github.com/madler/zlib.git
+[submodule "3DGS_Render_glb_unpack/thirdparty/zstd"]
+	path = 3DGS_Render_glb_unpack/thirdparty/zstd
+	url = https://github.com/facebook/zstd.git
+[submodule "3DGS_Render_glb_unpack/thirdparty/bc7enc_rdo"]
+	path = 3DGS_Render_glb_unpack/thirdparty/bc7enc_rdo
+	url = https://github.com/richgel999/bc7enc_rdo.git
+	branch = master

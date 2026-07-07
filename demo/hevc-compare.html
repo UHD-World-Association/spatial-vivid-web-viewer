@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>UWA HEVC 解码对比</title>
+  <style>
+    :root { color-scheme: dark; font: 15px system-ui, sans-serif; }
+    body { margin: 0; padding: 18px; background: #111827; color: #e5e7eb; }
+    main { max-width: 1100px; margin: auto; }
+    button, input { font: inherit; border: 1px solid #4b5563; border-radius: 5px; padding: 7px 9px; background: #1f2937; color: inherit; }
+    button { cursor: pointer; background: #2563eb; border-color: #3b82f6; }
+    button:disabled { cursor: wait; opacity: .55; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 8px 0; }
+    input[type=url] { flex: 1 1 300px; }
+    pre { white-space: pre-wrap; overflow: auto; background: #030712; padding: 12px; border-radius: 6px; min-height: 240px; }
+    .hint { color: #9ca3af; line-height: 1.5; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>UWA HEVC：WebCodecs / FFmpeg 输出对比</h1>
+  <p class="hint">页面只比较解码后的紧凑 YUV 字节，不启动渲染器、不改变现有首帧计时。iPhone 请使用 Safari 打开，并保持页面停留到结果出现。</p>
+  <div class="row">
+    <label>library <input id="libraryUrl" type="url" value="assets/1M.glb"></label>
+    <label>lumber <input id="lumberUrl" type="url" value="assets/lumber.glb"></label>
+    <button id="run">开始对比</button>
+    <button id="download" disabled>下载 JSON</button>
+  </div>
+  <div id="status">就绪</div>
+  <pre id="output">尚未开始。</pre>
+</main>
+<script type="module" src="./hevc-compare.js"></script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+prefix=/d/GS/UWA/ffmpeg-wasm-install
+exec_prefix=${prefix}
+libdir=/d/GS/UWA/ffmpeg-wasm-install/lib
+includedir=/d/GS/UWA/ffmpeg-wasm-install/include
+
+Name: libswresample
+Description: FFmpeg audio resampling library
+Version: 6.3.100
+Requires: libavutil >= 60.26.100
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lswresample -lm
+Libs.private: 
+Cflags: -I${includedir}

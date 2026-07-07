@@ -12,11 +12,11 @@
     "license": "MIT",
     "type": "module",
     "scripts": {
-        "build-demo": "mkdir -p ./build/demo && cp -r ./demo ./build/ && cp ./node_modules/three/build/three.module.js ./build/demo/lib/three.module.js",
-        "build-library": "npx rollup -c && mkdir -p ./build/demo/lib && cp ./build/gaussian-splats-3d.module.* ./build/demo/lib/",
+        "build-demo": "mkdir -p ./build/demo/lib && cp -r ./demo/. ./build/demo/ && cp ./node_modules/three/build/three.module.js ./build/demo/lib/three.module.js && cp ./browser.html ./build/demo/browser.html",
+        "build-library": "npx rollup -c && mkdir -p ./build/demo/lib && cp ./build/gaussian-splats-3d* ./build/demo/lib/ && cp ./src/loaders/splatUWA/splat_uwa_wasm.js ./src/loaders/splatUWA/splat_uwa_wasm.wasm ./src/loaders/splatUWA/splat_uwa_reconstruction_wasm.js ./src/loaders/splatUWA/splat_uwa_reconstruction_wasm.wasm ./src/loaders/splatUWA/SplatDecoderBootstrap.worker.js ./src/loaders/splatUWA/SplatDecoder.worker.js ./src/loaders/splatUWA/SplatReconstruction.worker.js ./src/loaders/splatUWA/WebCodecsVideoDecoder.js ./src/loaders/splatUWA/WebCodecsCapabilityCanary.js ./src/loaders/splatUWA/TextureStrategy.js ./build/demo/lib/ && for file in ./src/loaders/splatUWA/splat_uwa_wasm_pthread.js ./src/loaders/splatUWA/splat_uwa_wasm_pthread.wasm ./src/loaders/splatUWA/splat_uwa_wasm_pthread.worker.js; do [ ! -f \"$file\" ] || cp \"$file\" ./build/demo/lib/; done",
         "build": "npm run build-library && npm run build-demo",
-        "build-demo-windows": "(if not exist \".\\build\\demo\" mkdir .\\build\\demo) && xcopy /E .\\demo .\\build\\demo && xcopy .\\node_modules\\three\\build\\three.module.js .\\build\\demo\\lib\\",
-        "build-library-windows": "npx rollup -c && (if not exist \".\\build\\demo\\lib\" mkdir .\\build\\demo\\lib) && copy .\\build\\gaussian-splats-3d* .\\build\\demo\\lib\\",
+        "build-demo-windows": "(if not exist \".\\build\\demo\" mkdir .\\build\\demo) && xcopy /E .\\demo .\\build\\demo && xcopy .\\node_modules\\three\\build\\three.module.js .\\build\\demo\\lib\\ && copy .\\browser.html .\\build\\demo\\browser.html",
+        "build-library-windows": "npx rollup -c && (if not exist \".\\build\\demo\\lib\" mkdir .\\build\\demo\\lib) && copy .\\build\\gaussian-splats-3d* .\\build\\demo\\lib\\ && copy .\\src\\loaders\\splatUWA\\splat_uwa_wasm.js .\\build\\demo\\lib\\ && copy .\\src\\loaders\\splatUWA\\splat_uwa_wasm.wasm .\\build\\demo\\lib\\ && copy .\\src\\loaders\\splatUWA\\splat_uwa_reconstruction_wasm.js .\\build\\demo\\lib\\ && copy .\\src\\loaders\\splatUWA\\splat_uwa_reconstruction_wasm.wasm .\\build\\demo\\lib\\ && copy .\\src\\loaders\\splatUWA\\SplatDecoderBootstrap.worker.js .\\build\\demo\\lib\\ && copy .\\src\\loaders\\splatUWA\\SplatDecoder.worker.js .\\build\\demo\\lib\\ && copy .\\src\\loaders\\splatUWA\\SplatReconstruction.worker.js .\\build\\demo\\lib\\ && copy .\\src\\loaders\\splatUWA\\WebCodecsVideoDecoder.js .\\build\\demo\\lib\\ && copy .\\src\\loaders\\splatUWA\\WebCodecsCapabilityCanary.js .\\build\\demo\\lib\\ && copy .\\src\\loaders\\splatUWA\\TextureStrategy.js .\\build\\demo\\lib\\ && (if exist .\\src\\loaders\\splatUWA\\splat_uwa_wasm_pthread.js copy .\\src\\loaders\\splatUWA\\splat_uwa_wasm_pthread.js .\\build\\demo\\lib\\) && (if exist .\\src\\loaders\\splatUWA\\splat_uwa_wasm_pthread.wasm copy .\\src\\loaders\\splatUWA\\splat_uwa_wasm_pthread.wasm .\\build\\demo\\lib\\) && (if exist .\\src\\loaders\\splatUWA\\splat_uwa_wasm_pthread.worker.js copy .\\src\\loaders\\splatUWA\\splat_uwa_wasm_pthread.worker.js .\\build\\demo\\lib\\)",
         "build-windows": "npm run build-library-windows && npm run build-demo-windows",
         "watch": "npx npm-watch ",
         "demo": "node util/server.js -d ./build/demo",
@@ -49,13 +49,14 @@
         "javascript"
     ],
     "devDependencies": {
-        "@babel/core": "7.22.0",
+        "@babel/core": "^7.29.7",
         "@babel/eslint-parser": "7.22.11",
         "@babel/plugin-proposal-class-properties": "7.18.6",
         "@babel/preset-env": "7.22.10",
-        "babel-loader": "9.1.3",
-        "@rollup/plugin-terser": "0.4.4",
+        "@rollup/plugin-terser": "^1.0.0",
+        "@rollup/plugin-url": "^8.0.2",
         "@rollup/pluginutils": "5.0.5",
+        "babel-loader": "9.1.3",
         "eslint": "8.47.0",
         "eslint-config-google": "0.14.0",
         "file-loader": "6.2.0",
@@ -63,7 +64,7 @@
         "npm-watch": "0.11.0",
         "prettier": "3.0.2",
         "prettier-eslint": "15.0.1",
-        "rollup": "3.28.1",
+        "rollup": "^3.30.0",
         "url-loader": "4.1.1"
     },
     "peerDependencies": {
@@ -73,6 +74,19 @@
         "build/gaussian-splats-3d.umd.cjs",
         "build/gaussian-splats-3d.umd.cjs.map",
         "build/gaussian-splats-3d.module.js",
-        "build/gaussian-splats-3d.module.js.map"
+        "build/gaussian-splats-3d.module.js.map",
+        "build/demo/lib/SplatDecoder.worker.js",
+        "build/demo/lib/SplatDecoderBootstrap.worker.js",
+        "build/demo/lib/SplatReconstruction.worker.js",
+        "build/demo/lib/WebCodecsVideoDecoder.js",
+        "build/demo/lib/WebCodecsCapabilityCanary.js",
+        "build/demo/lib/TextureStrategy.js",
+        "build/demo/lib/splat_uwa_wasm.js",
+        "build/demo/lib/splat_uwa_wasm.wasm",
+        "build/demo/lib/splat_uwa_wasm_pthread.js",
+        "build/demo/lib/splat_uwa_wasm_pthread.wasm",
+        "build/demo/lib/splat_uwa_wasm_pthread.worker.js",
+        "build/demo/lib/splat_uwa_reconstruction_wasm.js",
+        "build/demo/lib/splat_uwa_reconstruction_wasm.wasm"
     ]
 }

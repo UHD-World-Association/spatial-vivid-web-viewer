@@ -50,6 +50,9 @@ http
       case ".jpg":
         contentType = "image/jpg";
         break;
+      case ".wasm":
+        contentType = "application/wasm";
+        break;
     }
 
     const requestTime = performance.now() / 1000;

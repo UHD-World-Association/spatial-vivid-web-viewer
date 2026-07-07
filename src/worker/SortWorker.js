@@ -1,15 +1,17 @@
 import SorterWasm from './sorter.wasm';
 import SorterWasmNoSIMD from './sorter_no_simd.wasm';
-import SorterWasmNonShared from './sorter_non_shared.wasm';
-import SorterWasmNoSIMDNonShared from './sorter_no_simd_non_shared.wasm';
-import { isIOS, getIOSSemever } from '../Util.js';
 import { Constants } from '../Constants.js';
+import {
+    createSortResultBufferPool,
+    initializeIdentityCandidate,
+    isSortGenerationCurrent,
+    reconstructTreeCandidate
+} from './SortWorkerProtocol.js';
 
-function sortWorker(self) {
+function sortWorker(self, helpers) {
 
     let wasmInstance;
     let wasmMemory;
-    let useSharedMemory;
     let integerBasedSort;
     let dynamicMode;
     let splatCount;
@@ -23,67 +25,145 @@ function sortWorker(self) {
     let centersOffset;
     let modelViewProjOffset;
     let countsZero;
-    let sortedIndexesOut;
     let distanceMapRange;
     let uploadedSplatCount;
+    let generation;
+    let treeGeneration = 0;
+    let treePool = null;
+    let resultBufferPool = null;
+    let protocolFallbackCount = 0;
     let Constants;
 
-    function sort(splatSortCount, splatRenderCount, modelViewProj,
-                  usePrecomputedDistances, copyIndexesToSort, copyPrecomputedDistances, copyTransforms) {
-        const sortStartTime = performance.now();
+    const postSortFailure = (sortRequest, error) => {
+        const message = {
+            'sortError': true,
+            'requestId': sortRequest?.requestId,
+            'generation': sortRequest?.generation,
+            'treeGeneration': sortRequest?.treeGeneration,
+            'error': error?.message || String(error)
+        };
+        try {
+            self.postMessage(message);
+        } catch (_) {}
+    };
 
-        if (!useSharedMemory) {
-            const indexesToSort = new Uint32Array(wasmMemory, indexesToSortOffset, copyIndexesToSort.byteLength / Constants.BytesPerInt);
-            indexesToSort.set(copyIndexesToSort);
-            const transforms = new Float32Array(wasmMemory, transformsOffset, copyTransforms.byteLength / Constants.BytesPerFloat);
-            transforms.set(copyTransforms);
-            if (usePrecomputedDistances) {
-                let precomputedDistances;
-                if (integerBasedSort) {
-                    precomputedDistances = new Int32Array(wasmMemory, precomputedDistancesOffset,
-                                                          copyPrecomputedDistances.byteLength / Constants.BytesPerInt);
-                } else {
-                    precomputedDistances = new Float32Array(wasmMemory, precomputedDistancesOffset,
-                                                            copyPrecomputedDistances.byteLength / Constants.BytesPerFloat);
-                }
-                precomputedDistances.set(copyPrecomputedDistances);
+    const fillCandidateIndexes = (sortRequest, indexesToSort, splatRenderCount) => {
+        const assemblyStartTime = performance.now();
+        let usedLegacyCandidate = false;
+        if (sortRequest.indexesToSort) {
+            const source = sortRequest.indexesToSort instanceof Uint32Array ?
+                sortRequest.indexesToSort : new Uint32Array(sortRequest.indexesToSort);
+            indexesToSort.set(source.subarray(0, splatRenderCount), 0);
+            usedLegacyCandidate = true;
+        } else if (sortRequest.candidateMode === 'tree') {
+            if (!treePool || sortRequest.treeGeneration !== treeGeneration) {
+                throw new Error('Compact sort tree data is unavailable for this generation.');
             }
+            const orderedNodeIds = sortRequest.orderedNodeIds instanceof Uint32Array ?
+                sortRequest.orderedNodeIds : new Uint32Array(sortRequest.orderedNodeIds);
+            helpers.reconstructTreeCandidate(indexesToSort, treePool.packedIndexes, treePool.nodeOffsets,
+                                             treePool.nodeCounts, orderedNodeIds, splatRenderCount);
+        } else if (sortRequest.candidateMode !== 'identity') {
+            throw new Error(`Unsupported sort candidate mode: ${sortRequest.candidateMode}.`);
+        }
+        return {
+            'candidateAssemblyTime': performance.now() - assemblyStartTime,
+            usedLegacyCandidate
+        };
+    };
+
+    const postSortResult = (sortRequest, sortMessage, resultBuffer) => {
+        sortMessage.sortedIndexesBuffer = resultBuffer;
+        sortMessage.sortedIndexes = new Uint32Array(resultBuffer, 0, sortMessage.splatRenderCount);
+        try {
+            self.postMessage(sortMessage, [resultBuffer]);
+        } catch (transferError) {
+            protocolFallbackCount++;
+            sortMessage.protocolFallbackCount = protocolFallbackCount;
+            sortMessage.transferFallback = true;
+            let fallbackBuffer = resultBuffer;
+            if (fallbackBuffer.byteLength === 0) {
+                fallbackBuffer = new ArrayBuffer(resultBufferPool.bufferByteLength);
+                const sortedIndexes = new Uint32Array(wasmMemory, sortedIndexesOffset, sortMessage.splatRenderCount);
+                new Uint32Array(fallbackBuffer, 0, sortMessage.splatRenderCount).set(sortedIndexes);
+            }
+            sortMessage.sortedIndexesBuffer = fallbackBuffer;
+            sortMessage.sortedIndexes = new Uint32Array(fallbackBuffer, 0, sortMessage.splatRenderCount);
+            try {
+                self.postMessage(sortMessage);
+                resultBufferPool.recycle(fallbackBuffer);
+            } catch (fallbackError) {
+                resultBufferPool.recycle(fallbackBuffer);
+                postSortFailure(sortRequest, new Error(
+                    `Unable to send sort result: ${transferError.message}; fallback failed: ${fallbackError.message}`
+                ));
+            }
+        }
+    };
+
+    function sort(sortRequest, splatSortCount, splatRenderCount) {
+        const sortStartTime = performance.now();
+        const indexesToSort = new Uint32Array(wasmMemory, indexesToSortOffset, splatCount);
+        const assemblyMetrics = fillCandidateIndexes(sortRequest, indexesToSort, splatRenderCount);
+
+        if (dynamicMode) {
+            const copyTransforms = sortRequest.transforms;
+            if (!copyTransforms) throw new Error('Dynamic sorting requires scene transforms.');
+            const transforms = new Float32Array(wasmMemory, transformsOffset,
+                                                copyTransforms.byteLength / Constants.BytesPerFloat);
+            transforms.set(copyTransforms);
+        }
+        if (sortRequest.usePrecomputedDistances) {
+            const copyPrecomputedDistances = sortRequest.precomputedDistances;
+            if (!copyPrecomputedDistances) throw new Error('GPU sorting requires precomputed distances.');
+            let precomputedDistances;
+            if (integerBasedSort) {
+                precomputedDistances = new Int32Array(wasmMemory, precomputedDistancesOffset,
+                                                      copyPrecomputedDistances.byteLength / Constants.BytesPerInt);
+            } else {
+                precomputedDistances = new Float32Array(wasmMemory, precomputedDistancesOffset,
+                                                        copyPrecomputedDistances.byteLength / Constants.BytesPerFloat);
+            }
+            precomputedDistances.set(copyPrecomputedDistances);
         }
 
         if (!countsZero) countsZero = new Uint32Array(distanceMapRange);
-        new Float32Array(wasmMemory, modelViewProjOffset, 16).set(modelViewProj);
+        new Float32Array(wasmMemory, modelViewProjOffset, 16).set(sortRequest.modelViewProj);
         new Uint32Array(wasmMemory, frequenciesOffset, distanceMapRange).set(countsZero);
+        const wasmSortStartTime = performance.now();
         wasmInstance.exports.sortIndexes(indexesToSortOffset, centersOffset, precomputedDistancesOffset,
                                          mappedDistancesOffset, frequenciesOffset, modelViewProjOffset,
                                          sortedIndexesOffset, sceneIndexesOffset, transformsOffset, distanceMapRange,
-                                         splatSortCount, splatRenderCount, splatCount, usePrecomputedDistances, integerBasedSort,
-                                         dynamicMode);
+                                         splatSortCount, splatRenderCount, splatCount,
+                                         sortRequest.usePrecomputedDistances, integerBasedSort, dynamicMode);
+        const wasmSortTime = performance.now() - wasmSortStartTime;
 
-        const sortMessage = {
+        const outputCopyStartTime = performance.now();
+        const resultBuffer = resultBufferPool.take();
+        const sortedIndexes = new Uint32Array(wasmMemory, sortedIndexesOffset, splatRenderCount);
+        new Uint32Array(resultBuffer, 0, splatRenderCount).set(sortedIndexes);
+        const outputCopyTime = performance.now() - outputCopyStartTime;
+        postSortResult(sortRequest, {
             'sortDone': true,
+            'requestId': sortRequest.requestId,
+            'generation': generation,
+            'treeGeneration': treeGeneration,
             'splatSortCount': splatSortCount,
             'splatRenderCount': splatRenderCount,
-            'sortTime': 0
-        };
-        if (!useSharedMemory) {
-            const sortedIndexes = new Uint32Array(wasmMemory, sortedIndexesOffset, splatRenderCount);
-            if (!sortedIndexesOut || sortedIndexesOut.length < splatRenderCount) {
-                sortedIndexesOut = new Uint32Array(splatRenderCount);
-            }
-            sortedIndexesOut.set(sortedIndexes);
-            sortMessage.sortedIndexes = sortedIndexesOut;
-        }
-        const sortEndTime = performance.now();
-
-        sortMessage.sortTime = sortEndTime - sortStartTime;
-
-        self.postMessage(sortMessage);
+            'sortTime': performance.now() - sortStartTime,
+            'candidateAssemblyTime': assemblyMetrics.candidateAssemblyTime,
+            'wasmSortTime': wasmSortTime,
+            'outputCopyTime': outputCopyTime,
+            'poolMissCount': resultBufferPool.poolMissCount,
+            'protocolFallbackCount': protocolFallbackCount,
+            'usedLegacyCandidate': assemblyMetrics.usedLegacyCandidate
+        }, resultBuffer);
     }
 
     self.onmessage = (e) => {
         if (e.data.centers) {
-            centers = e.data.centers;
-            sceneIndexes = e.data.sceneIndexes;
+            const centers = e.data.centers;
+            const sceneIndexes = e.data.sceneIndexes;
             if (integerBasedSort) {
                 new Int32Array(wasmMemory, centersOffset + e.data.range.from * Constants.BytesPerInt * 4,
                                e.data.range.count * 4).set(new Int32Array(centers));
@@ -96,36 +176,75 @@ function sortWorker(self) {
                                 e.data.range.count).set(new Uint32Array(sceneIndexes));
             }
             uploadedSplatCount = e.data.range.from + e.data.range.count;
-        } else if (e.data.sort) {
-            const renderCount = Math.min(e.data.sort.splatRenderCount || 0, uploadedSplatCount);
-            const sortCount = Math.min(e.data.sort.splatSortCount || 0, uploadedSplatCount);
-            const usePrecomputedDistances = e.data.sort.usePrecomputedDistances;
-
-            let copyIndexesToSort;
-            let copyPrecomputedDistances;
-            let copyTransforms;
-            if (!useSharedMemory) {
-                copyIndexesToSort = e.data.sort.indexesToSort;
-                copyTransforms = e.data.sort.transforms;
-                if (usePrecomputedDistances) copyPrecomputedDistances = e.data.sort.precomputedDistances;
+        } else if (e.data.registerSortTree) {
+            const registration = e.data.registerSortTree;
+            try {
+                const packedIndexes = new Uint32Array(registration.packedIndexes);
+                const nodeOffsets = new Uint32Array(registration.nodeOffsets);
+                const nodeCounts = new Uint32Array(registration.nodeCounts);
+                if (nodeOffsets.length !== nodeCounts.length || packedIndexes.length > splatCount) {
+                    throw new Error('Invalid compact sort tree dimensions.');
+                }
+                treePool = { packedIndexes, nodeOffsets, nodeCounts };
+                treeGeneration = registration.treeGeneration;
+                self.postMessage({
+                    'sortTreeRegistered': true,
+                    'generation': generation,
+                    'treeGeneration': treeGeneration,
+                    'nodeCount': nodeOffsets.length,
+                    'indexCount': packedIndexes.length
+                });
+            } catch (error) {
+                treePool = null;
+                self.postMessage({
+                    'sortTreeRegistrationError': true,
+                    'generation': registration.generation,
+                    'treeGeneration': registration.treeGeneration,
+                    'error': error?.message || String(error)
+                });
             }
-            sort(sortCount, renderCount, e.data.sort.modelViewProj, usePrecomputedDistances,
-                 copyIndexesToSort, copyPrecomputedDistances, copyTransforms);
+        } else if (e.data.clearSortTree) {
+            treePool = null;
+            treeGeneration = e.data.clearSortTree.treeGeneration;
+        } else if (e.data.recycleSortResult) {
+            const recycled = e.data.recycleSortResult;
+            if (recycled.generation === generation && resultBufferPool) {
+                resultBufferPool.recycle(recycled.buffer);
+            }
+        } else if (e.data.sort) {
+            const sortRequest = e.data.sort;
+            const legacyRequest = sortRequest.indexesToSort && sortRequest.generation === undefined;
+            if (!legacyRequest && !helpers.isSortGenerationCurrent(sortRequest, generation, treeGeneration)) {
+                self.postMessage({
+                    'sortCanceled': true,
+                    'requestId': sortRequest.requestId,
+                    'generation': sortRequest.generation,
+                    'treeGeneration': sortRequest.treeGeneration
+                });
+                return;
+            }
+            const availableSplatCount = sortRequest.usePrecomputedDistances ? splatCount : uploadedSplatCount;
+            const renderCount = Math.min(sortRequest.splatRenderCount || 0, availableSplatCount);
+            const sortCount = Math.min(sortRequest.splatSortCount || 0, availableSplatCount);
+            try {
+                sort(sortRequest, sortCount, renderCount);
+            } catch (error) {
+                postSortFailure(sortRequest, error);
+            }
         } else if (e.data.init) {
             // Yep, this is super hacky and gross :(
             Constants = e.data.init.Constants;
 
             splatCount = e.data.init.splatCount;
-            useSharedMemory = e.data.init.useSharedMemory;
             integerBasedSort = e.data.init.integerBasedSort;
             dynamicMode = e.data.init.dynamicMode;
             distanceMapRange = e.data.init.distanceMapRange;
+            generation = e.data.init.generation;
+            treeGeneration = e.data.init.treeGeneration;
             uploadedSplatCount = 0;
 
             const CENTERS_BYTES_PER_ENTRY = integerBasedSort ? (Constants.BytesPerInt * 4) : (Constants.BytesPerFloat * 4);
-
             const sorterWasmBytes = new Uint8Array(e.data.init.sorterWasmBytes);
-
             const matrixSize = 16 * Constants.BytesPerFloat;
             const memoryRequiredForIndexesToSort = splatCount * Constants.BytesPerInt;
             const memoryRequiredForCenters = splatCount * CENTERS_BYTES_PER_ENTRY;
@@ -140,31 +259,23 @@ function sortWorker(self) {
             const memoryRequiredforTransforms = dynamicMode ? (Constants.MaxScenes * matrixSize) : 0;
             const extraMemory = Constants.MemoryPageSize * 32;
 
-            const totalRequiredMemory = memoryRequiredForIndexesToSort +
-                                        memoryRequiredForCenters +
-                                        memoryRequiredForModelViewProjectionMatrix +
-                                        memoryRequiredForPrecomputedDistances +
-                                        memoryRequiredForMappedDistances +
-                                        memoryRequiredForIntermediateSortBuffers +
-                                        memoryRequiredForSortedIndexes +
-                                        memoryRequiredforTransformIndexes +
-                                        memoryRequiredforTransforms +
-                                        extraMemory;
+            const totalRequiredMemory = memoryRequiredForIndexesToSort + memoryRequiredForCenters +
+                                        memoryRequiredForModelViewProjectionMatrix + memoryRequiredForPrecomputedDistances +
+                                        memoryRequiredForMappedDistances + memoryRequiredForIntermediateSortBuffers +
+                                        memoryRequiredForSortedIndexes + memoryRequiredforTransformIndexes +
+                                        memoryRequiredforTransforms + extraMemory;
             const totalPagesRequired = Math.floor(totalRequiredMemory / Constants.MemoryPageSize ) + 1;
             const sorterWasmImport = {
                 module: {},
                 env: {
                     memory: new WebAssembly.Memory({
                         initial: totalPagesRequired,
-                        maximum: totalPagesRequired,
-                        shared: true,
+                        maximum: totalPagesRequired
                     }),
                 }
             };
             WebAssembly.compile(sorterWasmBytes)
-            .then((wasmModule) => {
-                return WebAssembly.instantiate(wasmModule, sorterWasmImport);
-            })
+            .then((wasmModule) => WebAssembly.instantiate(wasmModule, sorterWasmImport))
             .then((instance) => {
                 wasmInstance = instance;
                 indexesToSortOffset = 0;
@@ -177,58 +288,33 @@ function sortWorker(self) {
                 sceneIndexesOffset = sortedIndexesOffset + memoryRequiredForSortedIndexes;
                 transformsOffset = sceneIndexesOffset + memoryRequiredforTransformIndexes;
                 wasmMemory = sorterWasmImport.env.memory.buffer;
-                if (useSharedMemory) {
-                    self.postMessage({
-                        'sortSetupPhase1Complete': true,
-                        'indexesToSortBuffer': wasmMemory,
-                        'indexesToSortOffset': indexesToSortOffset,
-                        'sortedIndexesBuffer': wasmMemory,
-                        'sortedIndexesOffset': sortedIndexesOffset,
-                        'precomputedDistancesBuffer': wasmMemory,
-                        'precomputedDistancesOffset': precomputedDistancesOffset,
-                        'transformsBuffer': wasmMemory,
-                        'transformsOffset': transformsOffset
-                    });
-                } else {
-                    self.postMessage({
-                        'sortSetupPhase1Complete': true
-                    });
-                }
-            });
+                helpers.initializeIdentityCandidate(new Uint32Array(wasmMemory, indexesToSortOffset, splatCount), splatCount);
+                resultBufferPool = helpers.createSortResultBufferPool(memoryRequiredForSortedIndexes, 2);
+                self.postMessage({
+                    'sortSetupPhase1Complete': true,
+                    'generation': generation,
+                    'treeGeneration': treeGeneration
+                });
+            })
+            .catch((error) => postSortFailure(e.data.init, error));
         }
     };
 }
 
-export function createSortWorker(splatCount, useSharedMemory, enableSIMDInSort, integerBasedSort, dynamicMode,
-                                 splatSortDistanceMapPrecision = Constants.DefaultSplatSortDistanceMapPrecision) {
+export function createSortWorker(splatCount, enableSIMDInSort, integerBasedSort, dynamicMode,
+                                 splatSortDistanceMapPrecision = Constants.DefaultSplatSortDistanceMapPrecision,
+                                 generation = 0, treeGeneration = 0) {
+    const workerSource = `(${sortWorker.toString()})(self, {
+        initializeIdentityCandidate: ${initializeIdentityCandidate.toString()},
+        reconstructTreeCandidate: ${reconstructTreeCandidate.toString()},
+        createSortResultBufferPool: ${createSortResultBufferPool.toString()},
+        isSortGenerationCurrent: ${isSortGenerationCurrent.toString()}
+    })`;
     const worker = new Worker(
-        URL.createObjectURL(
-            new Blob(['(', sortWorker.toString(), ')(self)'], {
-                type: 'application/javascript',
-            }),
-        ),
+        URL.createObjectURL(new Blob([workerSource], { type: 'application/javascript' }))
     );
 
-    let sourceWasm = SorterWasm;
-
-    // iOS makes choosing the right WebAssembly configuration tricky :(
-    const iOSSemVer = isIOS() ? getIOSSemever() : null;
-    if (!enableSIMDInSort && !useSharedMemory) {
-        sourceWasm = SorterWasmNoSIMD;
-        // Testing on various devices has shown that even when shared memory is disabled, the WASM module with shared
-        // memory can still be used most of the time -- the exception seems to be iOS devices below 16.4
-        if (iOSSemVer && iOSSemVer.major <= 16 && iOSSemVer.minor < 4) {
-            sourceWasm = SorterWasmNoSIMDNonShared;
-        }
-    } else if (!enableSIMDInSort) {
-        sourceWasm = SorterWasmNoSIMD;
-    } else if (!useSharedMemory) {
-        // Same issue with shared memory as above on iOS devices
-        if (iOSSemVer && iOSSemVer.major <= 16 && iOSSemVer.minor < 4) {
-            sourceWasm = SorterWasmNonShared;
-        }
-    }
-
+    const sourceWasm = enableSIMDInSort ? SorterWasm : SorterWasmNoSIMD;
     const sorterWasmBinaryString = atob(sourceWasm);
     const sorterWasmBytes = new Uint8Array(sorterWasmBinaryString.length);
     for (let i = 0; i < sorterWasmBinaryString.length; i++) {
@@ -239,10 +325,11 @@ export function createSortWorker(splatCount, useSharedMemory, enableSIMDInSort, 
         'init': {
             'sorterWasmBytes': sorterWasmBytes.buffer,
             'splatCount': splatCount,
-            'useSharedMemory': useSharedMemory,
             'integerBasedSort': integerBasedSort,
             'dynamicMode': dynamicMode,
             'distanceMapRange': 1 << splatSortDistanceMapPrecision,
+            'generation': generation,
+            'treeGeneration': treeGeneration,
             // Super hacky
             'Constants': {
                 'BytesPerFloat': Constants.BytesPerFloat,
@@ -251,6 +338,6 @@ export function createSortWorker(splatCount, useSharedMemory, enableSIMDInSort, 
                 'MaxScenes': Constants.MaxScenes
             }
         }
-    });
+    }, [sorterWasmBytes.buffer]);
     return worker;
 }

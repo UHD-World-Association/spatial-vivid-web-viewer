@@ -3,6 +3,17 @@ import { PlayCanvasCompressedPlyParser } from './loaders/ply/PlayCanvasCompresse
 import { PlyLoader } from './loaders/ply/PlyLoader.js';
 import { SpzLoader } from './loaders/spz/SpzLoader.js';
 import { SplatLoader } from './loaders/splat/SplatLoader.js';
+import { SplatUWALoader } from './loaders/splatUWA/SplatUWALoader.js';
+import {
+    detectWebGL2TextureCapabilities,
+    normalizeTextureStrategyChain,
+    normalizeTextureStrategy,
+    probeWebGL2TextureCapabilities,
+    selectTextureStrategy,
+    selectTextureStrategyChain,
+    TextureBuildCapabilities,
+    TextureStrategy
+} from './loaders/splatUWA/TextureStrategy.js';
 import { KSplatLoader } from './loaders/ksplat/KSplatLoader.js';
 import * as LoaderUtils from './loaders/Utils.js';
 import { SplatBuffer } from './loaders/SplatBuffer.js';
@@ -26,6 +37,15 @@ export {
     PlyLoader,
     SpzLoader,
     SplatLoader,
+    SplatUWALoader,
+    detectWebGL2TextureCapabilities,
+    normalizeTextureStrategyChain,
+    normalizeTextureStrategy,
+    probeWebGL2TextureCapabilities,
+    selectTextureStrategy,
+    selectTextureStrategyChain,
+    TextureBuildCapabilities,
+    TextureStrategy,
     KSplatLoader,
     LoaderUtils,
     SplatBuffer,

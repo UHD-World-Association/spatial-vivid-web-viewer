@@ -1,0 +1,14 @@
+prefix=/d/GS/UWA/ffmpeg-wasm-install
+exec_prefix=${prefix}
+libdir=/d/GS/UWA/ffmpeg-wasm-install/lib
+includedir=/d/GS/UWA/ffmpeg-wasm-install/include
+
+Name: libswscale
+Description: FFmpeg image rescaling library
+Version: 9.5.100
+Requires: libavutil >= 60.26.100
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lswscale -lm
+Libs.private: 
+Cflags: -I${includedir}

@@ -45,8 +45,9 @@ export class UncompressedSplatArray {
         FRC23: 37
     };
 
-    constructor(sphericalHarmonicsDegree = 0) {
+    constructor(sphericalHarmonicsDegree = 0, hasAstc = false) {
         this.sphericalHarmonicsDegree = sphericalHarmonicsDegree;
+        this.hasAstc = hasAstc; // Records whether this array contains ASTC data.
         this.sphericalHarmonicsCount = getSphericalHarmonicsComponentCountForDegree(this.sphericalHarmonicsDegree);
         this.componentCount = this.sphericalHarmonicsCount + BASE_COMPONENT_COUNT;
         this.defaultSphericalHarmonics = new Array(this.sphericalHarmonicsCount).fill(0);
@@ -92,5 +93,6 @@ export class UncompressedSplatArray {
             newSplat[i] = srcSplat[i];
         }
         this.addSplat(newSplat);
+        this.hasAstc = src.hasAstc;
     }
 }

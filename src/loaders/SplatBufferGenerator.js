@@ -14,12 +14,17 @@ export class SplatBufferGenerator {
         this.bucketSize = bucketSize;
     }
 
-    generateFromUncompressedSplatArray(splatArray) {
+    generateFromUncompressedSplatArray(splatArray, timing = null) {
+        const partitionStart = timing ? performance.now() : 0;
         const partitionResults = this.splatPartitioner.partitionUncompressedSplatArray(splatArray);
+        if (timing) {
+            const elapsed = performance.now() - partitionStart;
+            if (Number.isFinite(elapsed)) timing.splatBufferPartitionMs = (timing.splatBufferPartitionMs || 0) + elapsed;
+        }
         return SplatBuffer.generateFromUncompressedSplatArrays(partitionResults.splatArrays,
                                                                this.alphaRemovalThreshold, this.compressionLevel,
                                                                this.sceneCenter, this.blockSize, this.bucketSize,
-                                                               partitionResults.parameters);
+                                                               partitionResults.parameters, timing);
     }
 
     static getStandardGenerator(alphaRemovalThreshold = 1, compressionLevel = 1, sectionSize = 0, sceneCenter = new THREE.Vector3(),

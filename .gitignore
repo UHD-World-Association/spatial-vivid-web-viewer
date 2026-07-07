@@ -2,3 +2,26 @@ dist
 build
 node_modules
 **/*.DS_Store
+build4/3DGS_Render_glb_unpack/inputs
+build4/3DGS_Render_glb_unpack/output
+.vscode
+src/loaders/splatUWA/splat_uwa_wasm.js
+src/loaders/splatUWA/splat_uwa_wasm.wasm
+src/loaders/splatUWA/splat_uwa_reconstruction_wasm.js
+src/loaders/splatUWA/splat_uwa_reconstruction_wasm.wasm
+3DGS_Render_glb_unpack/output
+splatUWA.patch
+*.rsp
+
+*.glb
+# Bundled open-source demo scenes; keep all other GLB files ignored.
+!demo/assets/garden.glb
+!demo/assets/lumber.glb
+!demo/assets/nightshow.glb
+!demo/assets/1M.glb
+!demo/assets/sh_probe.glb
+!demo/assets/1M-no_video.glb
+temp/*
+talk/*
+AGENTS.md
+report.md

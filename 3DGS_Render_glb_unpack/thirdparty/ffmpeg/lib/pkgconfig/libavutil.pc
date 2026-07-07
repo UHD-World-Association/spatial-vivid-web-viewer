@@ -1,0 +1,14 @@
+prefix=/d/GS/UWA/ffmpeg-wasm-install
+exec_prefix=${prefix}
+libdir=/d/GS/UWA/ffmpeg-wasm-install/lib
+includedir=/d/GS/UWA/ffmpeg-wasm-install/include
+
+Name: libavutil
+Description: FFmpeg utility library
+Version: 60.26.100
+Requires: 
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lavutil -lm -pthread
+Libs.private: 
+Cflags: -I${includedir}

@@ -3,6 +3,7 @@ import { OrbitControls } from './OrbitControls.js';
 import { PlyLoader } from './loaders/ply/PlyLoader.js';
 import { SplatLoader } from './loaders/splat/SplatLoader.js';
 import { KSplatLoader } from './loaders/ksplat/KSplatLoader.js';
+import { SplatUWALoader } from './loaders/splatUWA/SplatUWALoader.js';
 import { SpzLoader } from './loaders/spz/SpzLoader.js';
 import { sceneFormatFromPath } from './loaders/Utils.js';
 import { LoadingSpinner } from './ui/LoadingSpinner.js';
@@ -26,6 +27,8 @@ import { RenderMode } from './RenderMode.js';
 import { LogLevel } from './LogLevel.js';
 import { SceneRevealMode } from './SceneRevealMode.js';
 import { SplatRenderMode } from './SplatRenderMode.js';
+import { UwaPostprocessSplatBuffer } from './loaders/splatUWA/postprocess/UwaPostprocess.js';
+import { runRenderPerformanceDiagnostic } from './diagnostics/RenderPerformanceDiagnostics.js';
 
 const THREE_CAMERA_FOV = 50;
 const MINIMUM_DISTANCE_TO_NEW_FOCAL_POINT = .75;
@@ -33,6 +36,221 @@ const MIN_SPLAT_COUNT_TO_SHOW_SPLAT_TREE_LOADING_SPINNER = 1500000;
 const FOCUS_MARKER_FADE_IN_SPEED = 10.0;
 const FOCUS_MARKER_FADE_OUT_SPEED = 2.5;
 const CONSECUTIVE_RENDERED_FRAMES_FOR_FPS_CALCULATION = 60;
+const INFO_PANEL_UPDATE_INTERVAL_MS = 1000;
+const TIMING_REPORT_SCHEMA = 'uwa.timing.report.v1';
+const TIMING_RUNTIME_VERSION = 'uwa';
+const TIMING_REPORT_TIMEOUT_MS = 120000;
+const SCREENSHOT_CAPTURE_TIMEOUT_MS = 15000;
+const TIMING_REPORT_TASK_NAMES = [
+    'firstSplatFrame',
+    'fullSplatFrame',
+    'firstFullSort',
+    'deferredVisibleRegion',
+    'splatTree',
+    'processingProfile'
+];
+
+const roundTimingMs = (value) => Number.isFinite(value) ? Number(value.toFixed(2)) : undefined;
+
+const absoluteNowMs = () => {
+    try {
+        const timeOrigin = performance.timeOrigin;
+        const now = performance.now();
+        const absolute = timeOrigin + now;
+        if (Number.isFinite(timeOrigin) && Number.isFinite(now) && Number.isFinite(absolute)) return absolute;
+    } catch (_) {}
+    return Date.now();
+};
+
+const absoluteClockMethod = () => {
+    try {
+        const timeOrigin = performance.timeOrigin;
+        const now = performance.now();
+        if (Number.isFinite(timeOrigin) && Number.isFinite(now) && Number.isFinite(timeOrigin + now)) {
+            return 'performance.timeOrigin+performance.now';
+        }
+    } catch (_) {}
+    return 'Date.now';
+};
+
+const addProcessingTimelineEvent = (processingProfile, id, startAbsMs, endAbsMs, lane = 'main.viewer') => {
+    if (!processingProfile || !Number.isFinite(startAbsMs) || !Number.isFinite(endAbsMs) || endAbsMs < startAbsMs) return;
+    let events = processingProfile.__timelineEvents;
+    if (!Array.isArray(events)) {
+        events = [];
+        try {
+            Object.defineProperty(processingProfile, '__timelineEvents', {
+                value: events,
+                enumerable: false,
+                configurable: true
+            });
+        } catch (_) {
+            processingProfile.__timelineEvents = events;
+        }
+    }
+    events.push({
+        id: `viewer.${id}`,
+        lane,
+        task: id,
+        startAbsMs,
+        endAbsMs,
+        durationMs: endAbsMs - startAbsMs,
+        source: 'Viewer.js',
+        evidence: 'measured'
+    });
+};
+
+const createJsonSafeSnapshot = (value) => {
+    const ancestors = new WeakSet();
+    const maxDepth = 24;
+    const maxArrayEntries = 4096;
+    const maxObjectEntries = 4096;
+
+    const snapshot = (current, depth) => {
+        if (current === null || typeof current === 'string' || typeof current === 'boolean') return current;
+        if (typeof current === 'number') {
+            if (Number.isFinite(current)) return current;
+            if (Number.isNaN(current)) return 'NaN';
+            return current > 0 ? 'Infinity' : '-Infinity';
+        }
+        if (typeof current === 'bigint') return current.toString();
+        if (typeof current === 'undefined' || typeof current === 'function' || typeof current === 'symbol') return undefined;
+        if (depth >= maxDepth) return {'type': 'Truncated', 'reason': 'maximum depth reached'};
+
+        if (typeof ArrayBuffer !== 'undefined' && current instanceof ArrayBuffer) {
+            return {'type': 'ArrayBuffer', 'byteLength': current.byteLength};
+        }
+        if (typeof ArrayBuffer !== 'undefined' && ArrayBuffer.isView(current)) {
+            return {
+                'type': current.constructor?.name || 'ArrayBufferView',
+                'byteLength': current.byteLength,
+                ...(Number.isFinite(current.length) ? {'length': current.length} : {})
+            };
+        }
+        if (typeof WebAssembly !== 'undefined' && WebAssembly.Module && current instanceof WebAssembly.Module) {
+            return {'type': 'WebAssembly.Module'};
+        }
+        if (typeof Blob !== 'undefined' && current instanceof Blob) {
+            return {'type': current.constructor?.name || 'Blob', 'size': current.size, 'mimeType': current.type || ''};
+        }
+        if (current instanceof Date) return Number.isNaN(current.getTime()) ? null : current.toISOString();
+        if (current instanceof Error) {
+            return {
+                'type': current.name || 'Error',
+                'message': current.message || String(current)
+            };
+        }
+        if (ancestors.has(current)) return {'type': 'CircularReference'};
+        ancestors.add(current);
+        try {
+            if (Array.isArray(current)) {
+                const result = current.slice(0, maxArrayEntries).map((entry) => {
+                    const safeEntry = snapshot(entry, depth + 1);
+                    return safeEntry === undefined ? null : safeEntry;
+                });
+                if (current.length > maxArrayEntries) {
+                    result.push({'type': 'Truncated', 'omittedEntries': current.length - maxArrayEntries});
+                }
+                return result;
+            }
+
+            const result = {};
+            const keys = Object.keys(current);
+            for (const key of keys.slice(0, maxObjectEntries)) {
+                let safeValue;
+                try {
+                    safeValue = snapshot(current[key], depth + 1);
+                } catch (error) {
+                    safeValue = {'type': 'SnapshotError', 'message': error?.message || String(error)};
+                }
+                if (safeValue !== undefined) result[key] = safeValue;
+            }
+            if (keys.length > maxObjectEntries) {
+                result.__truncated__ = {'omittedEntries': keys.length - maxObjectEntries};
+            }
+            return result;
+        } finally {
+            ancestors.delete(current);
+        }
+    };
+
+    try {
+        return snapshot(value, 0);
+    } catch (error) {
+        return {'type': 'SnapshotError', 'message': error?.message || String(error)};
+    }
+};
+
+const collectTimingEnvironment = () => {
+    const environment = {};
+    try {
+        if (typeof navigator !== 'undefined') {
+            environment.userAgent = navigator.userAgent;
+            environment.platform = navigator.platform;
+            environment.language = navigator.language;
+            environment.hardwareConcurrency = navigator.hardwareConcurrency;
+        }
+        if (typeof window !== 'undefined') {
+            environment.crossOriginIsolated = window.crossOriginIsolated;
+            environment.devicePixelRatio = window.devicePixelRatio;
+            environment.viewport = {'width': window.innerWidth, 'height': window.innerHeight};
+            if (window.screen) {
+                environment.screen = {
+                    'width': window.screen.width,
+                    'height': window.screen.height,
+                    'availWidth': window.screen.availWidth,
+                    'availHeight': window.screen.availHeight,
+                    'colorDepth': window.screen.colorDepth,
+                    'pixelDepth': window.screen.pixelDepth
+                };
+            }
+        }
+    } catch (_) {
+        // Environment diagnostics must never interrupt rendering.
+    }
+    return environment;
+};
+
+const getDebugLoggingEnabled = () => {
+    if (typeof window === 'undefined' || typeof URLSearchParams === 'undefined') return false;
+    try {
+        return new URLSearchParams(window.location?.search || '').has('debug');
+    } catch (_) {
+        return false;
+    }
+};
+
+const emitTimingTable = (label, scalarRows, collapsed = false) => {
+    if (typeof console === 'undefined') return;
+
+    const rows = scalarRows.filter((row) => Number.isFinite(row.ms)).map((row) => ({
+        phase: row.phase,
+        ms: roundTimingMs(row.ms),
+        ...(row.note ? { note: row.note } : {})
+    }));
+    let groupOpened = false;
+    try {
+        const group = collapsed ? console.groupCollapsed : console.group;
+        if (typeof group === 'function') {
+            group.call(console, label);
+            groupOpened = true;
+        } else if (typeof console.log === 'function') {
+            console.log(label);
+        }
+        if (rows.length > 0) {
+            if (typeof console.table === 'function') console.table(rows);
+            else if (typeof console.log === 'function') console.log(rows);
+        }
+    } catch (_) {
+        // Timing diagnostics must never interrupt rendering.
+    } finally {
+        if (groupOpened && typeof console.groupEnd === 'function') {
+            try {
+                console.groupEnd();
+            } catch (_) {}
+        }
+    }
+};
 
 /**
  * Viewer: Manages the rendering of splat scenes. Manages an instance of SplatMesh as well as a web worker
@@ -69,14 +287,22 @@ export class Viewer {
 
         // parent element of the Three.js renderer canvas
         this.rootElement = options.rootElement;
+        this.ownsRootElement = false;
 
-        // Tells the viewer to pretend the device pixel ratio is 1, which can boost performance on devices where it is larger,
-        // at a small cost to visual quality
-        this.ignoreDevicePixelRatio = options.ignoreDevicePixelRatio || false;
-        this.devicePixelRatio = this.ignoreDevicePixelRatio ? 1 : (window.devicePixelRatio || 1);
+        // Use an explicitly requested pixel ratio when provided.
+        if (options.ignoreDevicePixelRatio === undefined || options.ignoreDevicePixelRatio === null) {
+            options.ignoreDevicePixelRatio = true;
+        }
+        this.ignoreDevicePixelRatio = options.ignoreDevicePixelRatio;
+        const devicePixelRatio = Number(options.devicePixelRatio);
+        this.devicePixelRatio = Number.isFinite(devicePixelRatio) && devicePixelRatio > 0 ?
+            devicePixelRatio : (this.ignoreDevicePixelRatio ? 2 : (window.devicePixelRatio || 2));
 
         // Tells the viewer to use 16-bit floating point values when storing splat covariance data in textures, instead of 32-bit
-        this.halfPrecisionCovariancesOnGPU = options.halfPrecisionCovariancesOnGPU || false;
+        if (options.halfPrecisionCovariancesOnGPU === undefined || options.halfPrecisionCovariancesOnGPU === null) {
+            options.halfPrecisionCovariancesOnGPU = true;
+        }
+        this.halfPrecisionCovariancesOnGPU = options.halfPrecisionCovariancesOnGPU;
 
         // If 'threeScene' is valid, it will be rendered by the viewer along with the splat mesh
         this.threeScene = options.threeScene;
@@ -97,13 +323,8 @@ export class Viewer {
         }
         this.integerBasedSort = options.integerBasedSort;
 
-        // If 'sharedMemoryForWorkers' is true, a SharedArrayBuffer will be used to communicate with web workers. This method
-        // is faster than copying memory to or from web workers, but comes with security implications as outlined here:
-        // https://web.dev/articles/cross-origin-isolation-guide
-        // If enabled, it requires specific CORS headers to be present in the response from the server that is sent when
-        // loading the application. More information is available in the README.
-        if (options.sharedMemoryForWorkers === undefined || options.sharedMemoryForWorkers === null) options.sharedMemoryForWorkers = true;
-        this.sharedMemoryForWorkers = options.sharedMemoryForWorkers;
+        // Retained as a compatibility field. Sorting always uses ordinary ArrayBuffers.
+        this.sharedMemoryForWorkers = false;
 
         // if 'dynamicScene' is true, it tells the viewer to assume scene elements are not stationary or that the number of splats in the
         // scene may change. This prevents optimizations that depend on a static scene from being made. Additionally, if 'dynamicScene' is
@@ -119,7 +340,7 @@ export class Viewer {
         this.antialiased = options.antialiased || false;
 
         // This constant is added to the projected 2D screen-space splat scales
-        this.kernel2DSize = (options.kernel2DSize === undefined) ? 0.3 : options.kernel2DSize;
+        this.kernel2DSize = (options.kernel2DSize === undefined) ? 0.18 : options.kernel2DSize;
 
         this.webXRMode = options.webXRMode || WebXRMode.None;
         if (this.webXRMode !== WebXRMode.None) {
@@ -144,14 +365,16 @@ export class Viewer {
         this.focalAdjustment = options.focalAdjustment || 1.0;
 
         // Specify the maximum screen-space splat size, can help deal with large splats that get too unwieldy
-        this.maxScreenSpaceSplatSize = options.maxScreenSpaceSplatSize || 1024;
+        this.maxScreenSpaceSplatSize = options.maxScreenSpaceSplatSize || 324;
 
         // The verbosity of console logging
         this.logLevel = options.logLevel || LogLevel.None;
 
         // Degree of spherical harmonics to utilize in rendering splats (assuming the data is present in the splat scene).
-        // Valid values are 0 - 2. Default value is 0.
-        this.sphericalHarmonicsDegree = options.sphericalHarmonicsDegree || 0;
+        // Valid values are 0 - 3. Default value is 3; callers can explicitly select 0 to disable SH.
+        const requestedSphericalHarmonicsDegree = Number(options.sphericalHarmonicsDegree);
+        this.sphericalHarmonicsDegree = Number.isFinite(requestedSphericalHarmonicsDegree) ?
+            Math.max(0, Math.min(3, requestedSphericalHarmonicsDegree)) : 3;
 
         // When true, allows for usage of extra properties and attributes during rendering for effects such as opacity adjustment.
         // Default is false for performance reasons. These properties are separate from transform properties (scale, rotation, position)
@@ -184,14 +407,11 @@ export class Viewer {
         this.freeIntermediateSplatData = options.freeIntermediateSplatData;
 
         // It appears that for certain iOS versions, special actions need to be taken with the
-        // usage of SIMD instructions and shared memory
+        // usage of SIMD instructions
         if (isIOS()) {
             const semver = getIOSSemever();
             if (semver.major < 17) {
                 this.enableSIMDInSort = false;
-            }
-            if (semver.major < 16) {
-                this.sharedMemoryForWorkers = false;
             }
         }
 
@@ -209,6 +429,22 @@ export class Viewer {
         const maxPrecision = this.integerBasedSort ? 20 : 24;
         this.splatSortDistanceMapPrecision = clamp(this.splatSortDistanceMapPrecision, 10, maxPrecision);
 
+        // Require a larger camera change before re-sorting to reduce worker traffic while moving through dense scenes.
+        this.splatSortRotationThreshold = options.splatSortRotationThreshold ?? 0.2;
+        this.splatSortPositionThreshold = options.splatSortPositionThreshold ?? 2.0;
+        this.enableProgressiveSort = options.enableProgressiveSort ?? false;
+
+        // Discard gaussian fragments whose final alpha contribution is below this threshold. A value of zero
+        // preserves the original fixed-support shader exactly and can be used as a compatibility kill switch.
+        const minimumGaussianContribution = Number(options.minimumGaussianContribution ?? (1 / 1024));
+        this.minimumGaussianContribution = !Number.isFinite(minimumGaussianContribution) ?
+            (1 / 1024) : clamp(minimumGaussianContribution, 0, 1);
+
+        // Keep the online scale/rotation covariance path as the default for
+        // loading performance. Set this option to false to test the
+        // covariance-texture route.
+        this.useDirectScaleRotationCovariance = options.useDirectScaleRotationCovariance !== false;
+
         this.onSplatMeshChangedCallback = null;
         this.createSplatMesh();
 
@@ -221,17 +457,28 @@ export class Viewer {
 
         this.showMeshCursor = false;
         this.showControlPlane = false;
-        this.showInfo = false;
+        this.showInfo = !!options.showInfo;
 
         this.sceneHelper = null;
 
         this.sortWorker = null;
+        this.sortWorkerReady = false;
+        this.sortWorkerGeneration = 0;
+        this.sortWorkerTreeGeneration = 0;
+        this.sortWorkerTree = null;
+        this.sortWorkerTreeNodeIds = null;
+        this.sortWorkerTreeProtocolActive = false;
+        this.pendingSortWorkerTree = null;
+        this.sortRequestId = 0;
+        this.activeSortRequest = null;
+        this.sortProtocolFallbackCount = 0;
         this.sortRunning = false;
         this.splatRenderCount = 0;
         this.splatSortCount = 0;
         this.lastSplatSortCount = 0;
+        this.identityRenderIndexes = null;
+        this.deferredVisibleRegionUpdatePending = false;
         this.sortWorkerIndexesToSort = null;
-        this.sortWorkerSortedIndexes = null;
         this.sortWorkerPrecomputedDistances = null;
         this.sortWorkerTransforms = null;
         this.preSortMessages = [];
@@ -248,7 +495,26 @@ export class Viewer {
 
         this.currentFPS = 0;
         this.lastSortTime = 0;
+        this.lastSortMetrics = null;
         this.consecutiveRenderFrames = 0;
+        this.lastInfoPanelUpdateTime = null;
+        this.firstFrameStartTimeMs = options.firstFrameStartTimeMs;
+        this.firstFrameElapsedMs = null;
+        this.firstFrameScope = null;
+        this.firstFrameAt = null;
+        this.firstFrameObservationPending = false;
+        this.fullFrameAt = null;
+        this.fullFrameObservationPending = false;
+        this.uwaPreviewProfile = null;
+        this.splatBuildGeneration = 0;
+        this.currentMeshIsPreview = false;
+        this.firstFrameLabel = options.firstFrameLabel || 'First splat frame';
+        this.firstFrameBreakdown = options.firstFrameBreakdown || null;
+        this.timingReportSession = null;
+        this.pendingScreenshotCapture = null;
+        this.renderCount = 0;
+        this.renderPerformanceDiagnosticPromise = null;
+        this.lastRenderPerformanceDiagnostic = null;
 
         this.previousCameraTarget = new THREE.Vector3();
         this.nextCameraTarget = new THREE.Vector3();
@@ -258,6 +524,7 @@ export class Viewer {
         this.mouseDownTime = null;
 
         this.resizeObserver = null;
+        this.resizeRendererToObservedDimensions = null;
         this.mouseMoveListener = null;
         this.mouseDownListener = null;
         this.mouseUpListener = null;
@@ -265,6 +532,9 @@ export class Viewer {
 
         this.sortPromise = null;
         this.sortPromiseResolver = null;
+        this.activeSortTimingCallbacks = null;
+        this.lastProcessingProfile = null;
+        this.afterFirstVisibleFrameCallbacks = [];
         this.splatSceneDownloadPromises = {};
         this.splatSceneDownloadAndBuildPromise = null;
         this.splatSceneRemovalPromise = null;
@@ -273,8 +543,17 @@ export class Viewer {
         this.loadingSpinner.hide();
         this.loadingProgressBar = new LoadingProgressBar(this.rootElement || document.body);
         this.loadingProgressBar.hide();
-        this.infoPanel = new InfoPanel(this.rootElement || document.body);
-        this.infoPanel.hide();
+        this.infoPanel = new InfoPanel(this.rootElement || document.body, () => this.captureScreenshot(),
+                                      (diagnosticOptions) => this.runRenderPerformanceDiagnostic(diagnosticOptions));
+        this.infoPanel.setFirstFrameTime(this.firstFrameLabel, this.firstFrameElapsedMs);
+        if (this.showInfo) {
+            this.infoPanel.show();
+        } else {
+            this.infoPanel.hide();
+        }
+        if (options.timingReport !== undefined && options.timingReport !== null) {
+            this.createTimingReportSession(options.timingReport);
+        }
 
         this.usingExternalCamera = (this.dropInMode || this.camera) ? true : false;
         this.usingExternalRenderer = (this.dropInMode || this.renderer) ? true : false;
@@ -290,9 +569,565 @@ export class Viewer {
         this.splatMesh = new SplatMesh(this.splatRenderMode, this.dynamicScene, this.enableOptionalEffects,
                                        this.halfPrecisionCovariancesOnGPU, this.devicePixelRatio, this.gpuAcceleratedSort,
                                        this.integerBasedSort, this.antialiased, this.maxScreenSpaceSplatSize, this.logLevel,
-                                       this.sphericalHarmonicsDegree, this.sceneFadeInRateMultiplier, this.kernel2DSize);
+                                       this.sphericalHarmonicsDegree, this.sceneFadeInRateMultiplier, this.kernel2DSize,
+                                       this.minimumGaussianContribution, this.useDirectScaleRotationCovariance);
+        this.renderCount = 0;
         this.splatMesh.frustumCulled = false;
         if (this.onSplatMeshChangedCallback) this.onSplatMeshChangedCallback();
+    }
+
+    /**
+     * Compile the requested splat shader while loading is in progress. The
+     * material is retained by SplatMesh and only reused by an exact variant
+     * match during the subsequent full data build.
+     */
+    precompileSplatMaterial(options = {}) {
+        if (this.isDisposingOrDisposed() || !this.renderer || !this.camera || !this.splatMesh) return false;
+        this.splatMesh.setRenderer(this.renderer);
+        return this.splatMesh.precompileMaterial({ ...options, camera: this.camera });
+    }
+
+    createTimingReportSession(timingReportContext) {
+        const startedAt = Number.isFinite(this.firstFrameStartTimeMs) ? this.firstFrameStartTimeMs : performance.now();
+        const context = createJsonSafeSnapshot(timingReportContext) || {};
+        const session = {
+            startedAt,
+            context,
+            tasks: {},
+            taskPromises: [],
+            warnings: [],
+            buildAttached: false,
+            finalized: false,
+            firstFrameMetrics: null,
+            processingProfile: null,
+            splatBufferTimings: []
+        };
+
+        for (const taskName of TIMING_REPORT_TASK_NAMES) {
+            let resolveTask;
+            const promise = new Promise((resolve) => {
+                resolveTask = resolve;
+            });
+            session.tasks[taskName] = {
+                name: taskName,
+                status: 'pending',
+                startedElapsedMs: performance.now() - startedAt,
+                resolve: resolveTask
+            };
+            session.taskPromises.push(promise);
+        }
+
+        if (!context.warmupDiagnostics) {
+            session.warnings.push('Warmup diagnostics were unavailable when the Viewer timing session was created.');
+        }
+
+        this.timingReportSession = session;
+        this.infoPanel.setTimingReportPending();
+        session.timeoutId = window.setTimeout(() => {
+            for (const taskName of TIMING_REPORT_TASK_NAMES) {
+                if (session.tasks[taskName].status === 'pending') {
+                    this.settleTimingReportTask(session, taskName, 'timed_out', 'Timing collection exceeded 120 seconds.');
+                }
+            }
+        }, TIMING_REPORT_TIMEOUT_MS);
+        Promise.all(session.taskPromises).then(() => this.finalizeTimingReportSession(session));
+    }
+
+    settleTimingReportTask(session, taskName, status, detail = '') {
+        if (!session || session !== this.timingReportSession || session.finalized) return false;
+        const task = session.tasks[taskName];
+        if (!task || task.status !== 'pending') return false;
+
+        const endedElapsedMs = performance.now() - session.startedAt;
+        task.status = status;
+        task.endedElapsedMs = endedElapsedMs;
+        task.durationMs = endedElapsedMs - task.startedElapsedMs;
+        if (detail) task.detail = detail;
+        const resolveTask = task.resolve;
+        delete task.resolve;
+        resolveTask();
+        return true;
+    }
+
+    runAfterFirstVisibleFrame(callback) {
+        if (typeof callback !== 'function') return;
+        if (this.firstFrameElapsedMs !== null) {
+            callback();
+        } else {
+            this.afterFirstVisibleFrameCallbacks.push(callback);
+        }
+    }
+
+    scheduleFirstVisibleFrameObservation(frameScope = this.currentMeshIsPreview ? 'partial' : 'full') {
+        if (this.firstFrameObservationPending || this.firstFrameElapsedMs !== null || this.splatRenderCount <= 0) return;
+        this.firstFrameObservationPending = true;
+        const observe = () => {
+            this.firstFrameObservationPending = false;
+            if (this.isDisposingOrDisposed() || this.firstFrameElapsedMs !== null || this.splatRenderCount <= 0) return;
+
+            const startTime = Number.isFinite(this.firstFrameStartTimeMs) ? this.firstFrameStartTimeMs :
+                (Number.isFinite(this.firstFrameBreakdown?.decodeStartAt) ? this.firstFrameBreakdown.decodeStartAt : performance.now());
+            const firstFrameAt = performance.now();
+            this.firstFrameElapsedMs = firstFrameAt - startTime;
+            this.firstFrameAt = firstFrameAt;
+            this.firstFrameScope = frameScope;
+            this.infoPanel.setFirstFrameTime(this.firstFrameLabel, this.firstFrameElapsedMs);
+            if (typeof console !== 'undefined' && typeof console.log === 'function') {
+                try {
+                    console.log(`[Viewer Timing] ${this.firstFrameLabel}: ${roundTimingMs(this.firstFrameElapsedMs)} ms`);
+                } catch (_) {}
+            }
+            this.logUserFirstFrameTiming(firstFrameAt);
+            const timingSession = this.timingReportSession || null;
+            this.settleTimingReportTask(timingSession, 'firstSplatFrame', 'complete');
+            if (this.firstFrameScope !== 'partial') this.scheduleDeferredVisibleRegionUpdate(timingSession);
+            const callbacks = this.afterFirstVisibleFrameCallbacks.splice(0);
+            for (const callback of callbacks) {
+                try {
+                    callback();
+                } catch (error) {
+                    if (typeof console !== 'undefined' && typeof console.error === 'function') console.error(error);
+                }
+            }
+        };
+        if (typeof requestAnimationFrame === 'function') {
+            // The first rAF runs before the browser paints the frame submitted
+            // by render(). The second rAF runs in the following frame, after
+            // that paint opportunity has completed.
+            requestAnimationFrame(() => requestAnimationFrame(observe));
+        } else {
+            setTimeout(observe, 0);
+        }
+    }
+
+    scheduleFullVisibleFrameObservation() {
+        if (this.fullFrameObservationPending || this.fullFrameAt !== null || this.currentMeshIsPreview ||
+            this.splatRenderCount <= 0) return;
+        this.fullFrameObservationPending = true;
+        const observe = () => {
+            this.fullFrameObservationPending = false;
+            if (this.isDisposingOrDisposed() || this.fullFrameAt !== null || this.currentMeshIsPreview ||
+                this.splatRenderCount <= 0) return;
+            this.fullFrameAt = performance.now();
+            const start = this.firstFrameStartTimeMs ?? this.firstFrameBreakdown?.decodeStartAt;
+            if (this.timingReportSession) {
+                this.timingReportSession.fullFrameMetrics = {
+                    fullFrameAt: this.fullFrameAt,
+                    elapsedMs: Number.isFinite(start) ? this.fullFrameAt - start : null,
+                    renderedPointCount: this.splatRenderCount
+                };
+            }
+            this.settleTimingReportTask(this.timingReportSession, 'fullSplatFrame', 'complete');
+        };
+        if (typeof requestAnimationFrame === 'function') {
+            requestAnimationFrame(() => requestAnimationFrame(observe));
+        } else {
+            setTimeout(observe, 0);
+        }
+    }
+
+    cancelTimingReportSession(reason) {
+        const session = this.timingReportSession;
+        if (!session || session.finalized) return;
+        for (const taskName of TIMING_REPORT_TASK_NAMES) {
+            this.settleTimingReportTask(session, taskName, 'canceled', reason || 'Viewer disposed during timing collection.');
+        }
+    }
+
+    finalizeTimingReportSession(session) {
+        if (!session || session !== this.timingReportSession || session.finalized) return;
+        session.finalized = true;
+        if (session.timeoutId !== undefined) window.clearTimeout(session.timeoutId);
+
+        const tasks = {};
+        let complete = session.warnings.length === 0;
+        for (const taskName of TIMING_REPORT_TASK_NAMES) {
+            const task = session.tasks[taskName];
+            tasks[taskName] = createJsonSafeSnapshot(task);
+            if (task.status !== 'complete' && task.status !== 'skipped') {
+                complete = false;
+                session.warnings.push(`${taskName}: ${task.status}${task.detail ? ` (${task.detail})` : ''}`);
+            }
+        }
+
+        const context = session.context || {};
+        const input = context.input || null;
+        const timelineEvents = [];
+        const appendTimelineEvents = (value) => {
+            if (!Array.isArray(value)) return;
+            for (const event of value) {
+                if (!event || typeof event !== 'object') continue;
+                if (!Number.isFinite(event.startAbsMs) || !Number.isFinite(event.endAbsMs) ||
+                    event.endAbsMs < event.startAbsMs) continue;
+                timelineEvents.push({
+                    ...event,
+                    durationMs: Number.isFinite(event.durationMs) ? event.durationMs : event.endAbsMs - event.startAbsMs
+                });
+            }
+        };
+        appendTimelineEvents(session.processingProfile?.__timelineEvents);
+        if (this.lastProcessingProfile !== session.processingProfile) {
+            appendTimelineEvents(this.lastProcessingProfile?.__timelineEvents);
+        }
+        const warmupTrace = context.warmupDiagnostics?.warmupTrace;
+        const warmupDecoder = warmupTrace?.decoder;
+        if (warmupDecoder && typeof warmupDecoder === 'object') {
+            const appendWarmupEvent = (id, startAbsMs, endAbsMs) => appendTimelineEvents([{
+                id: `warmup.${id}`,
+                lane: 'decoder-coordinator',
+                task: id,
+                startAbsMs,
+                endAbsMs,
+                source: 'SplatDecoder.worker.js',
+                evidence: 'measured'
+            }]);
+            appendWarmupEvent('full-ready', warmupDecoder.fullReadyBeginAbsMs, warmupDecoder.fullReadyEndAbsMs);
+            for (const [name, branch] of Object.entries(warmupDecoder.branches || {})) {
+                appendWarmupEvent(name, branch?.beginAbsMs, branch?.endAbsMs);
+            }
+            appendWarmupEvent('reconstruction-compile', warmupDecoder.reconstructionCompile?.beginAbsMs,
+                warmupDecoder.reconstructionCompile?.endAbsMs);
+        }
+        for (const timing of session.splatBufferTimings) {
+            appendTimelineEvents(timing?.timelineEvents);
+            appendTimelineEvents(timing?.workerTimings?.timelineEvents);
+        }
+        const timelineLanes = new Set(timelineEvents.map((event) => event.lane).filter(Boolean));
+        const timeline = timelineEvents.length > 0 ? {
+            schema: 'uwa.load.timeline.v2',
+            clock: {
+                kind: 'absolute-epoch-ms',
+                unit: 'ms',
+                method: absoluteClockMethod()
+            },
+            events: timelineEvents,
+            flows: [],
+            coverage: {
+                viewer: timelineLanes.has('main.viewer'),
+                mesh: timelineLanes.has('main.mesh'),
+                coordinator: timelineLanes.has('decoder-coordinator')
+            }
+        } : null;
+        const report = {
+            'schema': TIMING_REPORT_SCHEMA,
+            'runtimeVersion': TIMING_RUNTIME_VERSION,
+            'runtimeSource': 'uwa/src/Viewer.js',
+            'generatedAt': new Date().toISOString(),
+            'status': complete ? 'complete' : 'partial',
+            'completionPolicy': {
+                'timeoutMs': TIMING_REPORT_TIMEOUT_MS,
+                'requiredTasks': TIMING_REPORT_TASK_NAMES.slice(),
+                'successfulTaskStatuses': ['complete', 'skipped'],
+                'elapsedOrigin': 'View click / firstFrameStartTimeMs'
+            },
+            'tasks': tasks,
+            'environment': createJsonSafeSnapshot(collectTimingEnvironment()),
+            'input': createJsonSafeSnapshot(input),
+            'config': createJsonSafeSnapshot(context.config || null),
+            'warmupDiagnostics': createJsonSafeSnapshot(context.warmupDiagnostics || null),
+            'loading': {
+                'firstFrameMetrics': createJsonSafeSnapshot(session.firstFrameMetrics),
+                'fullFrameMetrics': createJsonSafeSnapshot(session.fullFrameMetrics),
+                'rawBreakdown': createJsonSafeSnapshot(this.firstFrameBreakdown)
+            },
+            'splatBuffer': {
+                'uwaLoadTimings': createJsonSafeSnapshot(session.splatBufferTimings[0] || null),
+                'allUwaLoadTimings': createJsonSafeSnapshot(session.splatBufferTimings)
+            },
+            'processingProfile': createJsonSafeSnapshot(session.processingProfile || this.lastProcessingProfile),
+            ...(timeline ? { 'extensions': { 'timeline': timeline } } : {}),
+            'validation': {
+                'warnings': createJsonSafeSnapshot(session.warnings)
+            }
+        };
+
+        let serializedReport;
+        try {
+            serializedReport = JSON.stringify(report, null, 2);
+        } catch (error) {
+            report.status = 'partial';
+            report.validation.warnings.push(`JSON serialization fallback: ${error?.message || String(error)}`);
+            serializedReport = JSON.stringify(createJsonSafeSnapshot(report), null, 2);
+        }
+
+        const inputName = typeof input?.name === 'string' ? input.name.replace(/\.[^.]*$/, '') : 'scene';
+        const timestamp = report.generatedAt.replace(/[:.]/g, '-');
+        this.infoPanel.setTimingReportReady(serializedReport, `${inputName}-${timestamp}-timing.json`, report.status === 'complete');
+    }
+
+    logProcessingProfile(processingProfile) {
+        if (!processingProfile) return;
+
+        const splatCount = processingProfile.splatCount ?? processingProfile.meshSplatCount ?? 0;
+        emitTimingTable(`[Viewer Timing] Mesh / sort processing (${splatCount} splats)`, [
+            { phase: 'Total', ms: processingProfile.totalMs },
+            { phase: 'Mesh build', ms: processingProfile.meshBuildTotalMs },
+            { phase: 'Mesh scenes', ms: processingProfile.meshBuildScenesMs },
+            { phase: 'Mesh geometry/material', ms: processingProfile.meshBuildGeometryMaterialMs },
+            { phase: 'Mesh index maps', ms: processingProfile.meshBuildIndexMapsMs },
+            { phase: 'GPU data refresh', ms: processingProfile.meshRefreshGpuDataMs },
+            { phase: 'Data textures', ms: processingProfile.meshRefreshDataTexturesTotalMs },
+            { phase: 'Base data update', ms: processingProfile.meshUpdateBaseDataMs },
+            { phase: 'Direct compressed data', ms: processingProfile.meshDirectCompressedTextureDataMs },
+            { phase: 'UWA GPU direct install', ms: processingProfile.uwaGpuDirectInstallMs },
+            { phase: 'Sort data preparation', ms: processingProfile.meshSortDataPrepMs },
+            { phase: 'Sort-worker setup', ms: processingProfile.sortWorkerSetupMs },
+            { phase: 'First-sort dispatch', ms: processingProfile.firstSortDispatchMs },
+            { phase: 'First-sort end-to-end', ms: processingProfile.firstSortEndToEndMs }
+        ]);
+
+        if (!getDebugLoggingEnabled()) return;
+
+        emitTimingTable('[Viewer Timing] Detailed processing phases', [
+            { phase: 'total', ms: processingProfile.totalMs },
+            { phase: 'delayedExecuteWait', ms: processingProfile.delayedExecuteWaitMs },
+            { phase: 'meshBuildTotal', ms: processingProfile.meshBuildTotalMs },
+            { phase: 'meshBuildScenes', ms: processingProfile.meshBuildScenesMs },
+            { phase: 'meshBuildGeometryMaterial', ms: processingProfile.meshBuildGeometryMaterialMs },
+            { phase: 'meshBuildIndexMaps', ms: processingProfile.meshBuildIndexMapsMs },
+            { phase: 'meshRefreshGpuData', ms: processingProfile.meshRefreshGpuDataMs },
+            { phase: 'meshRefreshDataTextures', ms: processingProfile.meshRefreshDataTexturesTotalMs },
+            { phase: 'meshSetupDataTextures', ms: processingProfile.meshSetupDataTexturesMs },
+            { phase: 'meshFillBaseArrays', ms: processingProfile.meshFillBaseArraysMs },
+            { phase: 'meshUpdateBaseData', ms: processingProfile.meshUpdateBaseDataMs },
+            { phase: 'meshDirectCompressedTextureData', ms: processingProfile.meshDirectCompressedTextureDataMs },
+            { phase: 'uwaGpuDirectInstall', ms: processingProfile.uwaGpuDirectInstallMs },
+            { phase: 'meshFillAstcUvs', ms: processingProfile.meshFillAstcUvsMs },
+            { phase: 'meshUpdateDataTextures', ms: processingProfile.meshUpdateDataTexturesMs },
+            { phase: 'meshUpdateCenterColorsTexture', ms: processingProfile.meshUpdateCenterColorsTextureMs },
+            { phase: 'meshUpdateCovariancesTexture', ms: processingProfile.meshUpdateCovariancesTextureMs },
+            { phase: 'meshUpdateScaleRotationsTexture', ms: processingProfile.meshUpdateScaleRotationsTextureMs },
+            { phase: 'meshUpdateAstcUvTexture', ms: processingProfile.meshUpdateAstcUvTextureMs },
+            { phase: 'meshUpdateSphericalHarmonicsTexture', ms: processingProfile.meshUpdateSphericalHarmonicsTextureMs },
+            { phase: 'meshUpdateSceneIndexesTexture', ms: processingProfile.meshUpdateSceneIndexesTextureMs },
+            { phase: 'meshUpdateVisibleRegion', ms: processingProfile.meshUpdateVisibleRegionMs },
+            { phase: 'meshPrimeVisibleRegion', ms: processingProfile.meshPrimeVisibleRegionMs },
+            { phase: 'meshSortDataPrep', ms: processingProfile.meshSortDataPrepMs },
+            { phase: 'meshGpuDistanceBufferUpload', ms: processingProfile.meshGpuDistanceBufferUploadMs },
+            { phase: 'sortWorkerSetup', ms: processingProfile.sortWorkerSetupMs },
+            { phase: 'firstSortEndToEnd', ms: processingProfile.firstSortEndToEndMs },
+            { phase: 'firstSortWorker', ms: processingProfile.firstSortWorkerMs },
+            { phase: 'firstSortDispatch', ms: processingProfile.firstSortDispatchMs },
+            { phase: 'splatTreeAsync', ms: processingProfile.splatTreeAsyncMs }
+        ], true);
+        if (typeof console !== 'undefined' && typeof console.log === 'function') {
+            try {
+                console.log('[Viewer Timing] Raw processing profile', processingProfile);
+            } catch (_) {}
+        }
+    }
+
+    logUserFirstFrameTiming(firstFrameAt) {
+        const breakdown = this.firstFrameBreakdown;
+        if (!breakdown || breakdown.logged) return;
+
+        const processingProfile = this.lastProcessingProfile;
+        const frameScope = this.firstFrameScope || (processingProfile?.preview ? 'partial' : 'full');
+        breakdown.logged = true;
+        breakdown.loggedScope = frameScope;
+        const uwaLoadTimings = breakdown.uwaLoadTimings || {};
+        const workerTimings = uwaLoadTimings.workerTimings || {};
+        const wall = workerTimings.wall || {};
+        const prepare = workerTimings.prepare || {};
+        const shards = workerTimings.shards || {};
+        const loaderRequest = workerTimings.loaderRequest || {};
+        const renderReadyAt = processingProfile?.firstRenderReadyAt ?? processingProfile?.completedAt;
+        const processingToRenderReadyMs = Number.isFinite(renderReadyAt) && Number.isFinite(processingProfile?.startedAt) ?
+            renderReadyAt - processingProfile.startedAt : undefined;
+        const renderReadyToFirstFrameMs = Number.isFinite(renderReadyAt) && firstFrameAt >= renderReadyAt ?
+            firstFrameAt - renderReadyAt : undefined;
+        const wasmSubstreamsMs = Object.keys(prepare).length ? (prepare.decodeSubstreamsMs ?? (
+            (prepare.decodeNonVideoSubstreamsMs || 0) +
+            (prepare.astcTextureDecodeMs || 0) +
+            (prepare.bcTextureEncodeMs || 0) +
+            (prepare.webCodecsMs || 0) +
+            (prepare.ffmpegFallbackWallMs || 0)
+        )) : undefined;
+        const substreams = prepare.substreams || {};
+        const reconstructionToSplatBufferReadyWallMs =
+            Number.isFinite(wall.reconstructionStartAbsMs) &&
+            Number.isFinite(uwaLoadTimings.splatBufferBuildEndAbsMs) &&
+            uwaLoadTimings.splatBufferBuildEndAbsMs >= wall.reconstructionStartAbsMs ?
+                uwaLoadTimings.splatBufferBuildEndAbsMs - wall.reconstructionStartAbsMs : undefined;
+        const workerDataAssemblyCandidateMs = Number.isFinite(reconstructionToSplatBufferReadyWallMs) &&
+            Number.isFinite(wall.reconstructionWallMs) && Number.isFinite(uwaLoadTimings.splatBufferBuildMs) ?
+                reconstructionToSplatBufferReadyWallMs - wall.reconstructionWallMs -
+                    uwaLoadTimings.splatBufferBuildMs : undefined;
+        const workerDataAssemblyMs = Number.isFinite(workerDataAssemblyCandidateMs) &&
+            workerDataAssemblyCandidateMs >= 0 ? workerDataAssemblyCandidateMs : undefined;
+        const bundledSelectionToFirstFrameMs = Number.isFinite(breakdown.bundledSelectionAt) ?
+            firstFrameAt - breakdown.bundledSelectionAt : undefined;
+        const downloadToFirstFrameMs = Number.isFinite(breakdown.downloadStartAt) ?
+            firstFrameAt - breakdown.downloadStartAt : undefined;
+        const downloadCompleteToDecodeStartMs = Number.isFinite(breakdown.downloadToDecodeWaitMs) ?
+            breakdown.downloadToDecodeWaitMs :
+            (Number.isFinite(breakdown.downloadEndAt) && Number.isFinite(breakdown.decodeStartAt) ?
+                breakdown.decodeStartAt - breakdown.downloadEndAt : undefined);
+        const decodeStartToFirstFrameMs = Number.isFinite(breakdown.decodeStartAt) ?
+            firstFrameAt - breakdown.decodeStartAt : undefined;
+
+        const metricRows = [
+            { phase: 'bundledSelectionToFirstFrame', ms: bundledSelectionToFirstFrameMs,
+              note: 'From selecting a bundled scene to completion of the first rendered splat frame' },
+            { phase: 'downloadToFirstFrame', ms: downloadToFirstFrameMs,
+              note: 'From starting the bundled URL download to completion of the first rendered splat frame' },
+            { phase: 'downloadCompleteToDecodeStart', ms: downloadCompleteToDecodeStartMs,
+              note: 'From URL download completion until decoder warmup and texture policy are ready' },
+            { phase: 'decodeStartToFirstFrame', ms: decodeStartToFirstFrameMs,
+              note: 'From the Processing callback immediately before parse to the first rendered splat frame' },
+            { phase: 'totalDecodeStartToFirstSplatFrame', ms: this.firstFrameElapsedMs,
+              note: 'From decode-start to completion of the first rendered splat frame; download is excluded' },
+            { phase: 'clickToFileReadStart', ms: breakdown.fileReadStartAt - breakdown.clickAt,
+              note: 'Post-click validation, UI update, and texture strategy readiness until FileReader starts' },
+            { phase: 'fileReaderReadAsArrayBuffer', ms: breakdown.fileReadMs,
+              note: 'Browser FileReader reads the local file into an ArrayBuffer' },
+            { phase: 'workerMessageDispatch', ms: wall.requestToDecodeStartMs,
+              note: 'From the main-thread decode postMessage to decoder worker processing' },
+            { phase: 'wasmSubstreamsTotal', ms: wasmSubstreamsMs,
+              note: 'Total WASM substream decoding; see the substream rows below for details' },
+            { phase: 'substreamNonVideo', ms: prepare.decodeNonVideoSubstreamsMs,
+              note: 'Non-video substream decoding' },
+            { phase: 'substreamAstcTexture', ms: prepare.astcTextureDecodeMs,
+              note: 'ASTC texture substream decoding' },
+            { phase: 'substreamBcTextureEncode', ms: prepare.bcTextureEncodeMs,
+              note: 'BC texture encode' },
+            { phase: 'substream0', ms: substreams['0']?.primaryDecodeMs,
+              note: 'Substream 0 (non-video), single-stream WASM wall-clock elapsed time' },
+            { phase: 'substream1', ms: substreams['1']?.primaryDecodeMs,
+              note: 'Substream 1 (non-video), single-stream WASM wall-clock elapsed time' },
+            { phase: 'substream2', ms: substreams['2']?.primaryDecodeMs,
+              note: `Substream 2 (video), primary decode time on the ` +
+                    `${substreams['2']?.actualPath || prepare.videoDecoderPath || 'unknown'} path` },
+            { phase: 'substream3', ms: substreams['3']?.primaryDecodeMs,
+              note: 'Substream 3 (texture), overall wall-clock elapsed time for ASTC passthrough or BC transcoding' },
+            { phase: 'substream4', ms: substreams['4']?.primaryDecodeMs,
+              note: 'Substream 4 (non-video), single-stream WASM wall-clock elapsed time' },
+            { phase: 'substreamWebCodecsVideo', ms: prepare.webCodecsMs,
+              note: 'WebCodecs video substream decode wall-clock elapsed time' },
+            { phase: 'substreamWebCodecsPlaneCopy', ms: prepare.webCodecsCopyMs,
+              note: 'WebCodecs plane copy' },
+            { phase: 'substreamDecodedVideoJsToWasm', ms: prepare.jsToWasmInjectMs,
+              note: 'Inject WebCodecs decode results into WASM' },
+            { phase: 'substreamFfmpegFallbackVideo', ms: prepare.ffmpegFallbackWallMs,
+              note: 'FFmpeg WASM fallback video substream decode wall-clock elapsed time' },
+            { phase: 'reconstructionToSplatBufferReadyWall', ms: reconstructionToSplatBufferReadyWallMs,
+              note: 'From first reconstruction shard dispatch to main-thread SplatBuffer completion; ' +
+                    'continuous cross-thread wall-clock elapsed time' },
+            { phase: 'reconstructionWall', ms: wall.reconstructionWallMs,
+              note: 'End-to-end wall-clock elapsed time for parallel reconstruction by shard workers' },
+            { phase: 'reconstructionStartSinceTraceOrigin', ms: wall.reconstructionStartSinceTraceOriginMs,
+              note: 'From Loader parse trace origin to the first reconstruction shard dispatch' },
+            { phase: 'reconstructionEndSinceTraceOrigin', ms: wall.reconstructionEndSinceTraceOriginMs,
+              note: 'From Loader parse trace origin to final shard merge completion' },
+            { phase: 'reconstructionKernelTotalSum', ms: shards.kernelTotalMs,
+              note: 'Sum of kernelTotalMs across all shards; not wall-clock elapsed time' },
+            { phase: 'workerDataAssembly', ms: workerDataAssemblyMs,
+              note: 'Cross-thread interval from reconstruction completion to SplatBuffer start, including compaction, ' +
+                    'result assembly, transfer, postMessage, and main-thread receipt' },
+            { phase: 'splatBufferBuild', ms: uwaLoadTimings.splatBufferBuildMs,
+              note: 'Build SplatBuffer from worker result data' },
+            { phase: 'renderPrepToFirstFrame', ms: (processingToRenderReadyMs || 0) + (renderReadyToFirstFrameMs || 0),
+              note: 'From Viewer/SplatMesh rendering preparation to the first rendered frame' },
+            { phase: 'processingToRenderReady', ms: processingToRenderReadyMs,
+              note: 'SplatMesh, baseData, GPU texture, and index setup until render-ready' },
+            { phase: 'renderReadyToFirstFrame', ms: renderReadyToFirstFrameMs,
+              note: 'From render-ready to the next WebGL render, which is the first rendered frame' },
+            { phase: 'loaderWorkerRoundTrip', ms: uwaLoadTimings.workerRoundTripMs,
+              note: 'From the main thread sending the worker request to receiving decodeResult' },
+            { phase: 'postMessageReturn', ms: loaderRequest.postMessageReturnMs,
+              note: 'From decoder worker postMessage to main-thread onmessage receipt; estimated with Date.now' }
+        ];
+        emitTimingTable(`[UserFirstFrameTiming] total=${roundTimingMs(this.firstFrameElapsedMs)} ms`, metricRows);
+
+        const timingSession = this.timingReportSession;
+        if (timingSession && !timingSession.finalized) {
+            timingSession.firstFrameMetrics = {
+                firstFrameAt,
+                firstFrameScope: frameScope,
+                firstPartialFrameMs: frameScope === 'partial' ? this.firstFrameElapsedMs : null,
+                renderedPointCount: this.splatRenderCount,
+                previewProfile: frameScope === 'partial' ? createJsonSafeSnapshot(this.uwaPreviewProfile) : null,
+                totalDecodeStartToFirstSplatFrameMs: this.firstFrameElapsedMs,
+                rows: metricRows.filter((row) => Number.isFinite(row.ms)).map((row) => ({
+                    'phase': row.phase,
+                    'ms': roundTimingMs(row.ms),
+                    ...(row.note ? {'note': row.note} : {})
+                }))
+            };
+        }
+
+        if (typeof console !== 'undefined' && typeof console.log === 'function') {
+            try {
+                console.log('[UserFirstFrameTiming] raw', {
+                    firstFrameAt,
+                    fileBytes: breakdown.fileBytes,
+                    loader: uwaLoadTimings,
+                    processing: processingProfile
+                });
+            } catch (_) {}
+        }
+    }
+
+    ensureIdentityRenderIndexes(splatCount) {
+        if (!this.identityRenderIndexes || this.identityRenderIndexes.length < splatCount) {
+            const previousLength = this.identityRenderIndexes ? this.identityRenderIndexes.length : 0;
+            const nextIdentityIndexes = new Uint32Array(splatCount);
+            if (this.identityRenderIndexes) nextIdentityIndexes.set(this.identityRenderIndexes);
+            for (let i = previousLength; i < splatCount; i++) {
+                nextIdentityIndexes[i] = i;
+            }
+            this.identityRenderIndexes = nextIdentityIndexes;
+        }
+        return this.identityRenderIndexes;
+    }
+
+    scheduleDeferredVisibleRegionUpdate(timingSession = null) {
+        if (this.deferredVisibleRegionUpdatePending) {
+            this.settleTimingReportTask(timingSession, 'deferredVisibleRegion', 'skipped',
+                                        'A deferred visible-region update was already pending.');
+            return;
+        }
+        if (!this.splatMesh) {
+            this.settleTimingReportTask(timingSession, 'deferredVisibleRegion', 'canceled', 'SplatMesh was unavailable.');
+            return;
+        }
+        this.deferredVisibleRegionUpdatePending = true;
+        window.setTimeout(() => {
+            this.deferredVisibleRegionUpdatePending = false;
+            const processingProfile = timingSession?.processingProfile;
+            if (!this.splatMesh || !this.initialized || this.isDisposingOrDisposed()) {
+                if (processingProfile) processingProfile.deferredVisibleRegionStatus = 'canceled';
+                this.settleTimingReportTask(timingSession, 'deferredVisibleRegion', 'canceled',
+                                            'Viewer or SplatMesh was disposed before the deferred update.');
+                return;
+            }
+            const updateStartTime = performance.now();
+            let elapsedMs;
+            try {
+                this.splatMesh.updateVisibleRegion(false, SceneRevealMode.Instant);
+                elapsedMs = performance.now() - updateStartTime;
+                if (processingProfile) {
+                    processingProfile.deferredVisibleRegionStatus = 'complete';
+                    processingProfile.deferredVisibleRegionMs = elapsedMs;
+                }
+                this.settleTimingReportTask(timingSession, 'deferredVisibleRegion', 'complete');
+            } catch (error) {
+                elapsedMs = performance.now() - updateStartTime;
+                if (processingProfile) {
+                    processingProfile.deferredVisibleRegionStatus = 'failed';
+                    processingProfile.deferredVisibleRegionMs = elapsedMs;
+                }
+                this.settleTimingReportTask(timingSession, 'deferredVisibleRegion', 'failed', error?.message || String(error));
+                if (typeof console !== 'undefined' && typeof console.error === 'function') console.error(error);
+                return;
+            }
+            if (getDebugLoggingEnabled() && typeof console !== 'undefined' && typeof console.log === 'function') {
+                try {
+                    console.log(`[DeferredVisibleRegion] ${elapsedMs.toFixed(2)} ms`);
+                } catch (_) {}
+            }
+            this.forceRenderNextFrame();
+        }, 0);
     }
 
     init() {
@@ -302,10 +1137,11 @@ export class Viewer {
         if (!this.rootElement) {
             if (!this.usingExternalRenderer) {
                 this.rootElement = document.createElement('div');
-                this.rootElement.style.width = '100%';
-                this.rootElement.style.height = '100%';
-                this.rootElement.style.position = 'absolute';
+                this.rootElement.style.position = 'fixed';
+                this.rootElement.style.inset = '0';
+                this.rootElement.style.overflow = 'hidden';
                 document.body.appendChild(this.rootElement);
+                this.ownsRootElement = true;
             } else {
                 this.rootElement = this.renderer.domElement || document.body;
             }
@@ -348,7 +1184,9 @@ export class Viewer {
     setupRenderer() {
         if (!this.usingExternalRenderer) {
             const renderDimensions = new THREE.Vector2();
+            const normalizeDimension = (dimension) => Math.max(1, Math.round(Number.isFinite(dimension) ? dimension : 0));
             this.getRenderDimensions(renderDimensions);
+            renderDimensions.set(normalizeDimension(renderDimensions.x), normalizeDimension(renderDimensions.y));
 
             this.renderer = new THREE.WebGLRenderer({
                 antialias: false,
@@ -358,14 +1196,32 @@ export class Viewer {
             this.renderer.autoClear = true;
             this.renderer.setClearColor(new THREE.Color( 0x000000 ), 0.0);
             this.renderer.setSize(renderDimensions.x, renderDimensions.y);
+            this.renderer.domElement.style.display = 'block';
+            this.renderer.domElement.style.width = '100%';
+            this.renderer.domElement.style.height = '100%';
 
-            this.resizeObserver = new ResizeObserver(() => {
-                this.getRenderDimensions(renderDimensions);
-                this.renderer.setSize(renderDimensions.x, renderDimensions.y);
+            const observedDimensions = renderDimensions.clone();
+            const currentRendererDimensions = new THREE.Vector2();
+            this.resizeRendererToObservedDimensions = () => {
+                if (!this.renderer || this.renderer.xr.isPresenting) return;
+                this.renderer.getSize(currentRendererDimensions);
+                if (currentRendererDimensions.equals(observedDimensions)) return;
+
+                this.renderer.setSize(observedDimensions.x, observedDimensions.y, false);
                 this.forceRenderNextFrame();
+            };
+
+            this.resizeObserver = new ResizeObserver((entries) => {
+                const entry = entries && entries[0];
+                if (!entry || !entry.contentRect) return;
+
+                const width = normalizeDimension(entry.contentRect.width);
+                const height = normalizeDimension(entry.contentRect.height);
+                observedDimensions.set(width, height);
+                this.resizeRendererToObservedDimensions();
             });
-            this.resizeObserver.observe(this.rootElement);
             this.rootElement.appendChild(this.renderer.domElement);
+            this.resizeObserver.observe(this.rootElement);
         }
 
     }
@@ -382,6 +1238,9 @@ export class Viewer {
             });
             this.renderer.xr.addEventListener('sessionend', (e) => {
                 this.webXRActive = false;
+                if (this.resizeRendererToObservedDimensions) {
+                    this.resizeRendererToObservedDimensions();
+                }
             });
             this.renderer.xr.enabled = true;
             this.camera.position.copy(this.initialCameraPosition);
@@ -493,6 +1352,7 @@ export class Viewer {
                 case 'KeyI':
                     this.showInfo = !this.showInfo;
                     if (this.showInfo) {
+                        this.lastInfoPanelUpdateTime = null;
                         this.infoPanel.show();
                     } else {
                         this.infoPanel.hide();
@@ -581,7 +1441,9 @@ export class Viewer {
     }();
 
     getRenderDimensions(outDimensions) {
-        if (this.rootElement) {
+        if (this.renderer && !this.usingExternalRenderer) {
+            this.renderer.getSize(outDimensions);
+        } else if (this.rootElement) {
             outDimensions.x = this.rootElement.offsetWidth;
             outDimensions.y = this.rootElement.offsetHeight;
         } else {
@@ -656,7 +1518,9 @@ export class Viewer {
             if (!this.splatMesh) return;
             const splatCount = this.splatMesh.getSplatCount();
             if (splatCount > 0) {
-                this.splatMesh.updateVisibleRegionFadeDistance(this.sceneRevealMode);
+                this.splatMesh.updateVisibleRegionFadeDistance(
+                    this.currentMeshIsPreview || this.firstFrameScope === 'partial' ? SceneRevealMode.Instant : this.sceneRevealMode
+                );
                 this.splatMesh.updateTransforms();
                 this.getRenderDimensions(renderDimensions);
                 const focalLengthX = this.camera.projectionMatrix.elements[0] * 0.5 *
@@ -1071,6 +1935,18 @@ export class Viewer {
                 } else if (format === SceneFormat.Ply) {
                     return PlyLoader.loadFromURL(path, onProgress, progressiveBuild, onSectionBuilt, splatAlphaRemovalThreshold,
                                                  this.inMemoryCompressionLevel, optimizeSplatData, this.sphericalHarmonicsDegree, headers);
+                } else if (format === SceneFormat.SplatUWA) {
+                    return SplatUWALoader.loadFromURL(
+                        path,
+                        onProgress,
+                        progressiveBuild, // SplatUWA is currently implemented as a non-streaming path.
+                        onSectionBuilt,
+                        splatAlphaRemovalThreshold,
+                        this.inMemoryCompressionLevel,
+                        optimizeSplatData,
+                        this.sphericalHarmonicsDegree,
+                        headers
+                    );
                 }
             } else if (format === SceneFormat.Spz) {
                 return SpzLoader.loadFromURL(path, onProgress, splatAlphaRemovalThreshold, this.inMemoryCompressionLevel,
@@ -1095,9 +1971,33 @@ export class Viewer {
 
         return function(splatBuffers, splatBufferOptions = [], finalBuild = true, showLoadingUI = true,
                         showLoadingUIForSplatTreeBuild = true, replaceExisting = false,
-                        enableRenderBeforeFirstSort = false, preserveVisibleRegion = true) {
+                        enableRenderBeforeFirstSort = true, preserveVisibleRegion = true) {
 
             if (this.isDisposingOrDisposed()) return Promise.resolve();
+
+            const previewBuild = splatBuffers.some((buffer) => buffer?.isUwaPreviewResult === true);
+            if (previewBuild) finalBuild = false;
+            const buildGeneration = ++this.splatBuildGeneration;
+            const processingProfile = {
+                startedAt: performance.now(),
+                startedAtAbsMs: absoluteNowMs(),
+                finalBuild,
+                replaceExisting,
+                preserveVisibleRegion,
+                enableRenderBeforeFirstSort,
+                deferVisibleRegion: this.firstFrameElapsedMs === null && finalBuild,
+                deferSortDataPrep: !previewBuild && finalBuild && enableRenderBeforeFirstSort &&
+                    this.firstFrameElapsedMs === null && !this.sortWorker && !this.gpuAcceleratedSort
+            };
+            processingProfile.preview = previewBuild;
+            this.lastProcessingProfile = processingProfile;
+            const timingSession = !previewBuild && this.timingReportSession && !this.timingReportSession.buildAttached ?
+                this.timingReportSession : null;
+            if (timingSession) {
+                timingSession.buildAttached = true;
+                timingSession.processingProfile = processingProfile;
+                timingSession.splatBufferTimings = splatBuffers.map((splatBuffer) => splatBuffer?.uwaLoadTimings || null);
+            }
 
             let splatProcessingTaskId = null;
             const removeSplatProcessingTask = () => {
@@ -1106,26 +2006,104 @@ export class Viewer {
                     splatProcessingTaskId = null;
                 }
             };
+            const removeSplatProcessingTaskAfterFirstVisibleFrame = () => {
+                this.runAfterFirstVisibleFrame(removeSplatProcessingTask);
+            };
+            const finalizeProcessingAfterFirstVisibleFrame = () => {
+                this.runAfterFirstVisibleFrame(() => {
+                    removeSplatProcessingTask();
+                    finalizeProcessingProfile();
+                });
+            };
+            const finalizeProcessingProfile = (status = 'complete', detail = '') => {
+                if (processingProfile.completedAt !== undefined) return;
+                processingProfile.completedAt = performance.now();
+                processingProfile.completedAtAbsMs = absoluteNowMs();
+                processingProfile.totalMs = processingProfile.completedAt - processingProfile.startedAt;
+                addProcessingTimelineEvent(processingProfile, 'processingProfile',
+                    processingProfile.startedAtAbsMs, processingProfile.completedAtAbsMs);
+                this.lastProcessingProfile = processingProfile;
+                this.logProcessingProfile(processingProfile);
+                this.settleTimingReportTask(timingSession, 'processingProfile', status, detail);
+            };
+            const markFirstRenderReady = () => {
+                if (!Number.isFinite(processingProfile.firstRenderReadyAt)) {
+                    processingProfile.firstRenderReadyAt = performance.now();
+                    processingProfile.firstRenderReadyAtAbsMs = absoluteNowMs();
+                    processingProfile.firstRenderReadyMs = processingProfile.firstRenderReadyAt - processingProfile.startedAt;
+                    addProcessingTimelineEvent(processingProfile, 'firstRenderReady',
+                        processingProfile.firstRenderReadyAtAbsMs, processingProfile.firstRenderReadyAtAbsMs);
+                    this.forceRenderNextFrame();
+                }
+            };
 
             this.splatRenderReady = false;
-            return new Promise((resolve) => {
+            this.renderCount = 0;
+            return new Promise((resolve, reject) => {
+                const failBuild = (error) => {
+                    removeSplatProcessingTask();
+                    finalizeProcessingProfile('failed', error?.message || String(error));
+                    this.settleTimingReportTask(timingSession, 'firstFullSort', 'failed', error?.message || String(error));
+                    reject(error);
+                };
                 if (showLoadingUI) {
                     splatProcessingTaskId = this.loadingSpinner.addTask('Processing splats...');
                 }
+                const delayedExecuteStartTime = performance.now();
+                const delayedExecuteStartAbsMs = absoluteNowMs();
                 delayedExecute(() => {
-                    if (this.isDisposingOrDisposed()) {
+                    const delayedExecuteEndTime = performance.now();
+                    const delayedExecuteEndAbsMs = absoluteNowMs();
+                    processingProfile.delayedExecuteWaitMs = delayedExecuteEndTime - delayedExecuteStartTime;
+                    addProcessingTimelineEvent(processingProfile, 'delayedExecuteWait',
+                        delayedExecuteStartAbsMs, delayedExecuteEndAbsMs);
+                    if (this.isDisposingOrDisposed() || buildGeneration !== this.splatBuildGeneration) {
+                        finalizeProcessingProfile('canceled', 'Viewer was disposed before mesh processing.');
                         resolve();
                     } else {
-                        const buildResults = this.addSplatBuffersToMesh(splatBuffers, splatBufferOptions, finalBuild,
+                        processingProfile.deferSortDataPrep = !previewBuild && finalBuild && enableRenderBeforeFirstSort &&
+                            this.firstFrameElapsedMs === null && !this.sortWorker && !this.gpuAcceleratedSort &&
+                            buildGeneration === this.splatBuildGeneration;
+                        this.lastProcessingProfile = processingProfile;
+                        this.currentMeshIsPreview = previewBuild;
+                        let buildResults;
+                        try {
+                            buildResults = this.addSplatBuffersToMesh(splatBuffers, splatBufferOptions, finalBuild,
                                                                         showLoadingUIForSplatTreeBuild, replaceExisting,
-                                                                        preserveVisibleRegion);
-
-                        const maxSplatCount = this.splatMesh.getMaxSplatCount();
-                        if (this.sortWorker && this.sortWorker.maxSplatCount !== maxSplatCount) this.disposeSortWorker();
-                        // If we aren't calculating the splat distances from the center on the GPU, the sorting worker needs
-                        // splat centers and transform indexes so that it can calculate those distance values.
-                        if (!this.gpuAcceleratedSort) {
-                            this.preSortMessages.push({
+                                                                        preserveVisibleRegion, processingProfile);
+                        } catch (error) {
+                            failBuild(error);
+                            return;
+                        }
+                        if (buildResults.processingProfile) {
+                            Object.assign(processingProfile, buildResults.processingProfile);
+                        }
+                        const buildSplatMesh = this.splatMesh;
+                        let deferredSortDataPrepPrepared = !buildResults.deferredSortDataPrep;
+                        let deferredSortDataPrepEnqueued = false;
+                        let deferredPreSortMessage = null;
+                        const prepareDeferredSortData = () => {
+                            if (deferredSortDataPrepPrepared) return;
+                            const prepStartTime = performance.now();
+                            const prepStartAbsMs = absoluteNowMs();
+                            const sortData = buildSplatMesh.getDataForDistancesComputation(buildResults.from,
+                                                                                           buildResults.to);
+                            buildResults.centers = sortData.centers;
+                            buildResults.sceneIndexes = sortData.sceneIndexes;
+                            buildResults.deferredSortDataPrep = false;
+                            deferredSortDataPrepPrepared = true;
+                            const prepEndTime = performance.now();
+                            const prepEndAbsMs = absoluteNowMs();
+                            processingProfile.deferredSortDataPrepMs = prepEndTime - prepStartTime;
+                            addProcessingTimelineEvent(processingProfile, 'deferredSortDataPrep',
+                                prepStartAbsMs, prepEndAbsMs);
+                        };
+                        const enqueuePreSortMessage = () => {
+                            if (this.gpuAcceleratedSort || deferredSortDataPrepEnqueued) return deferredPreSortMessage;
+                            if (!buildResults.centers || !buildResults.sceneIndexes) {
+                                throw new Error('Sort data was not prepared before worker setup.');
+                            }
+                            deferredPreSortMessage = {
                                 'centers': buildResults.centers.buffer,
                                 'sceneIndexes': buildResults.sceneIndexes.buffer,
                                 'range': {
@@ -1133,31 +2111,301 @@ export class Viewer {
                                     'to': buildResults.to,
                                     'count': buildResults.count
                                 }
-                            });
+                            };
+                            this.preSortMessages.push(deferredPreSortMessage);
+                            deferredSortDataPrepEnqueued = true;
+                            return deferredPreSortMessage;
+                        };
+                        const removeDeferredPreSortMessage = () => {
+                            if (!deferredPreSortMessage) return;
+                            const messageIndex = this.preSortMessages.indexOf(deferredPreSortMessage);
+                            if (messageIndex >= 0) this.preSortMessages.splice(messageIndex, 1);
+                            deferredPreSortMessage = null;
+                        };
+                        if (buildResults.splatTreePromise) {
+                            buildResults.splatTreePromise.then(() => {
+                                if (this.isDisposingOrDisposed() || buildGeneration !== this.splatBuildGeneration ||
+                                    this.splatMesh !== buildSplatMesh) return;
+                                const resolvedTree = buildSplatMesh.getSplatTree();
+                                if (resolvedTree) this.registerSortWorkerTree(resolvedTree);
+                            }, () => {});
                         }
-                        const sortWorkerSetupPromise = (!this.sortWorker && maxSplatCount > 0) ?
-                                                         this.setupSortWorker(this.splatMesh) : Promise.resolve();
-                        sortWorkerSetupPromise.then(() => {
-                            if (this.isDisposingOrDisposed()) return;
-                            this.runSplatSort(true, true).then((sortRunning) => {
-                                if (!this.sortWorker || !sortRunning) {
-                                    this.splatRenderReady = true;
+                        if (timingSession) {
+                            if (buildResults.splatTreePromise) {
+                                buildResults.splatTreePromise.then(() => {
+                                    if (this.isDisposingOrDisposed() || !this.splatMesh?.getSplatTree()) {
+                                        this.settleTimingReportTask(timingSession, 'splatTree', 'canceled',
+                                                                    'SplatTree build ended after mesh disposal.');
+                                    } else {
+                                        this.settleTimingReportTask(timingSession, 'splatTree', 'complete');
+                                    }
+                                }).catch((error) => {
+                                    this.settleTimingReportTask(timingSession, 'splatTree', 'failed',
+                                                                error?.message || String(error));
+                                });
+                            } else {
+                                this.settleTimingReportTask(timingSession, 'splatTree', 'skipped',
+                                                            finalBuild ? 'No splats required a SplatTree.' : 'Build was not final.');
+                            }
+                        }
+
+                        if (!previewBuild && this.firstFrameScope === 'partial' && !processingProfile.deferVisibleRegion) {
+                            this.settleTimingReportTask(timingSession, 'deferredVisibleRegion', 'complete',
+                                'Full mesh visible region was updated during the final build.');
+                        }
+                        const maxSplatCount = this.splatMesh.getMaxSplatCount();
+                        processingProfile.splatCount = this.splatMesh.getSplatCount();
+                        processingProfile.maxSplatCount = maxSplatCount;
+                        if (previewBuild) {
+                            this.uwaPreviewProfile = processingProfile;
+                            const identityRenderIndexes = this.ensureIdentityRenderIndexes(processingProfile.splatCount);
+                            this.splatMesh.updateRenderIndexes(identityRenderIndexes, processingProfile.splatCount);
+                            this.splatRenderCount = processingProfile.splatCount;
+                            this.splatRenderReady = this.splatRenderCount > 0;
+                            markFirstRenderReady();
+                            finalizeProcessingAfterFirstVisibleFrame();
+                            resolve();
+                            return;
+                        }
+                        const shouldRenderBeforeSortWorkerSetup = enableRenderBeforeFirstSort &&
+                                                                  (this.firstFrameElapsedMs === null ||
+                                                                   this.firstFrameScope === 'partial') &&
+                                                                  !this.sortWorker &&
+                                                                  maxSplatCount > 0;
+                        if (this.sortWorker && this.sortWorker.maxSplatCount !== maxSplatCount) this.disposeSortWorker();
+                        const deferSortDataPrepUntilFirstVisibleFrame = !!buildResults.deferredSortDataPrep &&
+                            processingProfile.deferSortDataPrep && !previewBuild && finalBuild &&
+                            enableRenderBeforeFirstSort && this.firstFrameElapsedMs === null &&
+                            buildGeneration === this.splatBuildGeneration && this.splatMesh === buildSplatMesh &&
+                            shouldRenderBeforeSortWorkerSetup && !this.sortWorker && !this.gpuAcceleratedSort;
+                        if (!deferSortDataPrepUntilFirstVisibleFrame) {
+                            try {
+                                prepareDeferredSortData();
+                                enqueuePreSortMessage();
+                            } catch (error) {
+                                failBuild(error);
+                                return;
+                            }
+                        }
+                        const sortWorkerSetupStartTime = performance.now();
+                        const sortWorkerSetupStartAbsMs = absoluteNowMs();
+                        // When the first frame is allowed before the full sort,
+                        // do not initialize the sort worker on the critical
+                        // path.  On mobile browsers its WASM/worker startup
+                        // competes with reconstruction workers and can delay
+                        // the first visible RAF by hundreds of milliseconds.
+                        const deferSortWorkerSetup = deferSortDataPrepUntilFirstVisibleFrame &&
+                                                      !this.sortWorker && maxSplatCount > 0;
+                        const sortWorkerSetupPromise = deferSortWorkerSetup ?
+                            new Promise((resolve, reject) => {
+                                this.runAfterFirstVisibleFrame(() => {
+                                    if (this.isDisposingOrDisposed() || buildGeneration !== this.splatBuildGeneration ||
+                                        this.splatMesh !== buildSplatMesh || !shouldRenderBeforeSortWorkerSetup ||
+                                        this.sortWorker || this.gpuAcceleratedSort) {
+                                        resolve(false);
+                                        return;
+                                    }
+                                    try {
+                                        prepareDeferredSortData();
+                                        enqueuePreSortMessage();
+                                    } catch (error) {
+                                        removeDeferredPreSortMessage();
+                                        reject(error);
+                                        return;
+                                    }
+                                    if (this.isDisposingOrDisposed() || buildGeneration !== this.splatBuildGeneration ||
+                                        this.splatMesh !== buildSplatMesh || this.sortWorker) {
+                                        removeDeferredPreSortMessage();
+                                        resolve(false);
+                                        return;
+                                    }
+                                    Promise.resolve(this.setupSortWorker(buildSplatMesh)).then(() => resolve(true), reject);
+                                });
+                            }) :
+                            ((!this.sortWorker && maxSplatCount > 0) ?
+                                this.setupSortWorker(this.splatMesh) : Promise.resolve());
+                        let initialSortWorker = null;
+                        let pendingInitialSortProfileCallback = null;
+                        let initialSortProfileFinalized = false;
+                        const cancelInitialSortProfile = () => {
+                            if (initialSortProfileFinalized) return;
+                            initialSortProfileFinalized = true;
+                            this.settleTimingReportTask(timingSession, 'firstFullSort', 'canceled',
+                                                        'The initial full-sort worker was replaced or canceled.');
+                            if (pendingInitialSortProfileCallback) {
+                                const callbackIndex = this.runAfterNextSort.indexOf(pendingInitialSortProfileCallback);
+                                if (callbackIndex >= 0) this.runAfterNextSort.splice(callbackIndex, 1);
+                                pendingInitialSortProfileCallback = null;
+                            }
+                            if (initialSortWorker?._cancelTimingProfile === cancelInitialSortProfile) {
+                                initialSortWorker._cancelTimingProfile = null;
+                            }
+                            processingProfile.firstSortEndToEndMs = 0;
+                            processingProfile.firstSortWorkerMs = 0;
+                            finalizeProcessingProfile();
+                        };
+                        if (shouldRenderBeforeSortWorkerSetup) {
+                            const identityRenderIndexes = this.ensureIdentityRenderIndexes(processingProfile.splatCount);
+                            this.splatMesh.updateRenderIndexes(identityRenderIndexes, processingProfile.splatCount);
+                            this.splatRenderCount = processingProfile.splatCount;
+                            markFirstRenderReady();
+                            this.splatRenderReady = true;
+                            removeSplatProcessingTaskAfterFirstVisibleFrame();
+                            resolve();
+                        }
+                        sortWorkerSetupPromise.then((setupCompleted) => {
+                            const sortWorkerSetupEndTime = performance.now();
+                            const sortWorkerSetupEndAbsMs = absoluteNowMs();
+                            processingProfile.sortWorkerSetupMs = sortWorkerSetupEndTime - sortWorkerSetupStartTime;
+                            addProcessingTimelineEvent(processingProfile, 'sortWorkerSetup',
+                                sortWorkerSetupStartAbsMs, sortWorkerSetupEndAbsMs);
+                            if (setupCompleted === false) {
+                                if (shouldRenderBeforeSortWorkerSetup) {
+                                    this.settleTimingReportTask(timingSession, 'firstFullSort', 'canceled',
+                                                                'The deferred sort worker setup became stale.');
+                                    cancelInitialSortProfile();
+                                } else {
+                                    finalizeProcessingProfile('canceled', 'The deferred sort worker setup became stale.');
                                     removeSplatProcessingTask();
+                                    resolve();
+                                }
+                                return;
+                            }
+                            if (shouldRenderBeforeSortWorkerSetup && !initialSortWorker) {
+                                initialSortWorker = this.sortWorker;
+                                if (initialSortWorker) initialSortWorker._cancelTimingProfile = cancelInitialSortProfile;
+                            }
+                            if (this.isDisposingOrDisposed()) {
+                                if (shouldRenderBeforeSortWorkerSetup) {
+                                    this.settleTimingReportTask(timingSession, 'firstFullSort', 'canceled',
+                                                                'Viewer was disposed before the first full sort.');
+                                    cancelInitialSortProfile();
+                                } else {
+                                    finalizeProcessingProfile('canceled', 'Viewer was disposed before the first full sort.');
+                                    removeSplatProcessingTask();
+                                    resolve();
+                                }
+                                return;
+                            }
+                            if (shouldRenderBeforeSortWorkerSetup &&
+                                (initialSortProfileFinalized || this.sortWorker !== initialSortWorker)) {
+                                cancelInitialSortProfile();
+                                return;
+                            }
+                            if (buildGeneration !== this.splatBuildGeneration || this.splatMesh !== buildSplatMesh) {
+                                removeDeferredPreSortMessage();
+                                if (shouldRenderBeforeSortWorkerSetup) {
+                                    cancelInitialSortProfile();
+                                } else {
+                                    finalizeProcessingProfile('canceled', 'The build became stale before sorting.');
+                                    removeSplatProcessingTask();
+                                    resolve();
+                                }
+                                return;
+                            }
+                            const firstSortStartTime = performance.now();
+                            const firstSortStartAbsMs = absoluteNowMs();
+                            return this.runSplatSort(true, true, () => {
+                                this.settleTimingReportTask(timingSession, 'firstFullSort', 'complete');
+                            }, () => {
+                                this.settleTimingReportTask(timingSession, 'firstFullSort', 'canceled',
+                                                            'The initial full sort was canceled.');
+                                if (shouldRenderBeforeSortWorkerSetup) {
+                                    cancelInitialSortProfile();
+                                } else {
+                                    removeSplatProcessingTask();
+                                    finalizeProcessingProfile('canceled', 'The initial full sort was canceled.');
+                                    resolve();
+                                }
+                            }).then((sortRunning) => {
+                                const firstSortDispatchEndTime = performance.now();
+                                const firstSortDispatchEndAbsMs = absoluteNowMs();
+                                processingProfile.firstSortDispatchMs = firstSortDispatchEndTime - firstSortStartTime;
+                                addProcessingTimelineEvent(processingProfile, 'firstSortDispatch',
+                                    firstSortStartAbsMs, firstSortDispatchEndAbsMs);
+                                if (shouldRenderBeforeSortWorkerSetup) {
+                                    if (initialSortProfileFinalized) return;
+                                    if (this.isDisposingOrDisposed() || this.sortWorker !== initialSortWorker || !sortRunning) {
+                                        this.settleTimingReportTask(timingSession, 'firstFullSort',
+                                                                    maxSplatCount > 0 ? 'canceled' : 'skipped',
+                                                                    maxSplatCount > 0 ? 'The initial full sort was not dispatched.' :
+                                                                        'There were no splats to sort.');
+                                        cancelInitialSortProfile();
+                                    } else {
+                                        const finalizeAfterInitialSort = () => {
+                                            if (initialSortProfileFinalized) return;
+                                            if (this.sortWorker !== initialSortWorker) {
+                                                pendingInitialSortProfileCallback = null;
+                                                cancelInitialSortProfile();
+                                                return;
+                                            }
+                                            initialSortProfileFinalized = true;
+                                            pendingInitialSortProfileCallback = null;
+                                            if (initialSortWorker._cancelTimingProfile === cancelInitialSortProfile) {
+                                                initialSortWorker._cancelTimingProfile = null;
+                                            }
+                                    const firstSortEndAbsMs = absoluteNowMs();
+                                    processingProfile.firstSortEndToEndMs = performance.now() - firstSortStartTime;
+                                    addProcessingTimelineEvent(processingProfile, 'firstSortEndToEnd',
+                                        firstSortStartAbsMs, firstSortEndAbsMs);
+                                    processingProfile.firstSortWorkerMs = this.lastSortTime;
+                                    this.settleTimingReportTask(timingSession, 'firstFullSort', 'complete');
+                                    finalizeProcessingAfterFirstVisibleFrame();
+                                        };
+                                        pendingInitialSortProfileCallback = finalizeAfterInitialSort;
+                                        this.runAfterNextSort.push(finalizeAfterInitialSort);
+                                    }
+                                    return;
+                                }
+                                if (!this.sortWorker || !sortRunning) {
+                                    processingProfile.firstSortEndToEndMs = 0;
+                                    processingProfile.firstSortWorkerMs = 0;
+                                    markFirstRenderReady();
+                                    this.splatRenderReady = true;
+                                    if (maxSplatCount > 0) {
+                                        finalizeProcessingAfterFirstVisibleFrame();
+                                    } else {
+                                        removeSplatProcessingTask();
+                                        finalizeProcessingProfile();
+                                    }
+                                    this.settleTimingReportTask(timingSession, 'firstFullSort', 'skipped',
+                                                                maxSplatCount > 0 ? 'No sort worker was available.' :
+                                                                    'There were no splats to sort.');
+                                    if (maxSplatCount <= 0) {
+                                        this.settleTimingReportTask(timingSession, 'fullSplatFrame', 'skipped',
+                                                                    'There were no splats to render.');
+                                        this.settleTimingReportTask(timingSession, 'firstSplatFrame', 'skipped',
+                                                                    'There were no splats to render.');
+                                        this.settleTimingReportTask(timingSession, 'deferredVisibleRegion', 'skipped',
+                                                                    'There were no splats to render.');
+                                    }
+                                    if (maxSplatCount <= 0) finalizeProcessingProfile();
                                     resolve();
                                 } else {
                                     if (enableRenderBeforeFirstSort) {
+                                        markFirstRenderReady();
                                         this.splatRenderReady = true;
                                     } else {
                                         this.runAfterNextSort.push(() => {
+                                            markFirstRenderReady();
                                             this.splatRenderReady = true;
                                         });
                                     }
                                     this.runAfterNextSort.push(() => {
-                                        removeSplatProcessingTask();
+                                        const firstSortEndAbsMs = absoluteNowMs();
+                                        processingProfile.firstSortEndToEndMs = performance.now() - firstSortStartTime;
+                                        addProcessingTimelineEvent(processingProfile, 'firstSortEndToEnd',
+                                            firstSortStartAbsMs, firstSortEndAbsMs);
+                                        processingProfile.firstSortWorkerMs = this.lastSortTime;
+                                        this.settleTimingReportTask(timingSession, 'firstFullSort', 'complete');
+                                        finalizeProcessingAfterFirstVisibleFrame();
                                         resolve();
                                     });
                                 }
                             });
+                        }).catch((error) => {
+                            removeDeferredPreSortMessage();
+                            failBuild(error);
                         });
                     }
                 }, true);
@@ -1191,7 +2439,7 @@ export class Viewer {
         let splatOptimizingTaskId;
 
         return function(splatBuffers, splatBufferOptions, finalBuild = true, showLoadingUIForSplatTreeBuild = false,
-                        replaceExisting = false, preserveVisibleRegion = true) {
+                        replaceExisting = false, preserveVisibleRegion = true, processingProfile = null) {
             if (this.isDisposingOrDisposed()) return;
             let allSplatBuffers = [];
             let allSplatBufferOptions = [];
@@ -1199,7 +2447,11 @@ export class Viewer {
                 allSplatBuffers = this.splatMesh.scenes.map((scene) => scene.splatBuffer) || [];
                 allSplatBufferOptions = this.splatMesh.sceneOptions ? this.splatMesh.sceneOptions.map((sceneOptions) => sceneOptions) : [];
             }
-            allSplatBuffers.push(...splatBuffers);
+            const uwaResults = splatBuffers.filter((buffer) => buffer?.isUwaPostprocessResult);
+            const normalizedSplatBuffers = splatBuffers.map((buffer) =>
+                buffer?.isUwaPostprocessResult ? UwaPostprocessSplatBuffer.attachResult(buffer) : buffer
+            );
+            allSplatBuffers.push(...normalizedSplatBuffers);
             allSplatBufferOptions.push(...splatBufferOptions);
             if (this.renderer) this.splatMesh.setRenderer(this.renderer);
             const onSplatTreeIndexesUpload = (finished) => {
@@ -1219,8 +2471,18 @@ export class Viewer {
                     splatOptimizingTaskId = null;
                 }
             };
-            const buildResults = this.splatMesh.build(allSplatBuffers, allSplatBufferOptions, true, finalBuild, onSplatTreeIndexesUpload,
-                                                      onSplatTreeReady, preserveVisibleRegion);
+            const directUwaResults = uwaResults.filter((result) =>
+                !!result.compressedTextureData &&
+                result.positions instanceof Float32Array &&
+                result.scales instanceof Float32Array &&
+                result.rotations instanceof Float32Array
+            );
+            const buildResults = (directUwaResults.length === 1 && allSplatBuffers.length === 1) ?
+                this.splatMesh.buildFromUwaGpuData(directUwaResults[0], allSplatBufferOptions, finalBuild, true,
+                                                   onSplatTreeIndexesUpload, onSplatTreeReady,
+                                                   preserveVisibleRegion, processingProfile) :
+                this.splatMesh.build(allSplatBuffers, allSplatBufferOptions, true, finalBuild, onSplatTreeIndexesUpload,
+                                     onSplatTreeReady, preserveVisibleRegion, processingProfile);
             if (finalBuild && this.freeIntermediateSplatData) this.splatMesh.freeIntermediateSplatData();
             return buildResults;
         };
@@ -1234,27 +2496,72 @@ export class Viewer {
      */
     setupSortWorker(splatMesh) {
         if (this.isDisposingOrDisposed()) return;
-        return new Promise((resolve) => {
+        return new Promise((resolve, reject) => {
             const DistancesArrayType = this.integerBasedSort ? Int32Array : Float32Array;
-            const splatCount = splatMesh.getSplatCount();
             const maxSplatCount = splatMesh.getMaxSplatCount();
-            this.sortWorker = createSortWorker(maxSplatCount, this.sharedMemoryForWorkers, this.enableSIMDInSort,
-                                               this.integerBasedSort, this.splatMesh.dynamicMode, this.splatSortDistanceMapPrecision);
-            this.sortWorker.onmessage = (e) => {
+            const generation = ++this.sortWorkerGeneration;
+            const worker = createSortWorker(maxSplatCount, this.enableSIMDInSort, this.integerBasedSort,
+                                            this.splatMesh.dynamicMode, this.splatSortDistanceMapPrecision,
+                                            generation, this.sortWorkerTreeGeneration);
+            this.sortWorker = worker;
+            this.sortWorkerReady = false;
+            worker.onmessage = (e) => {
                 if (e.data.sortDone) {
-                    this.sortRunning = false;
-                    if (this.sharedMemoryForWorkers) {
-                        this.splatMesh.updateRenderIndexes(this.sortWorkerSortedIndexes, e.data.splatRenderCount);
-                    } else {
-                        const sortedIndexes = new Uint32Array(e.data.sortedIndexes.buffer, 0, e.data.splatRenderCount);
-                        this.splatMesh.updateRenderIndexes(sortedIndexes, e.data.splatRenderCount);
+                    const resultBuffer = e.data.sortedIndexesBuffer;
+                    const current = e.data.generation === generation &&
+                                    e.data.treeGeneration === this.sortWorkerTreeGeneration &&
+                                    this.sortWorker === worker &&
+                                    this.activeSortRequest?.requestId === e.data.requestId;
+                    if (!current) {
+                        this.recycleSortResultBuffer(worker, e.data.generation, resultBuffer);
+                        if (this.sortWorker === worker && this.activeSortRequest?.requestId === e.data.requestId) {
+                            this.sortRunning = false;
+                            this.activeSortRequest = null;
+                            const timingCallbacks = this.activeSortTimingCallbacks;
+                            this.activeSortTimingCallbacks = null;
+                            if (timingCallbacks?.worker === worker && timingCallbacks.onCanceled) {
+                                timingCallbacks.onCanceled();
+                            }
+                            if (this.sortPromiseResolver) {
+                                this.sortPromiseResolver();
+                                this.sortPromiseResolver = null;
+                            }
+                            this.sortAfterPendingTreeRegistration();
+                        }
+                        return;
                     }
-
+                    const geometryUpdateStartTime = performance.now();
+                    const sortedIndexes = resultBuffer ?
+                        new Uint32Array(resultBuffer, 0, e.data.splatRenderCount) :
+                        new Uint32Array(e.data.sortedIndexes.buffer, 0, e.data.splatRenderCount);
+                    this.splatMesh.updateRenderIndexes(sortedIndexes, e.data.splatRenderCount);
+                    const geometryUpdateTime = performance.now() - geometryUpdateStartTime;
+                    this.recycleSortResultBuffer(worker, generation, resultBuffer);
+                    this.sortRunning = false;
                     this.lastSplatSortCount = this.splatSortCount;
-
                     this.lastSortTime = e.data.sortTime;
-                    this.sortPromiseResolver();
-                    this.sortPromiseResolver = null;
+                    this.lastSortMetrics = {
+                        'requestId': e.data.requestId,
+                        'candidateAssemblyMs': e.data.candidateAssemblyTime || 0,
+                        'wasmSortMs': e.data.wasmSortTime || 0,
+                        'wasmOutputCopyMs': e.data.outputCopyTime || 0,
+                        'roundtripMs': performance.now() - this.activeSortRequest.dispatchedAt,
+                        'geometryIndexUpdateMs': geometryUpdateTime,
+                        'poolMissCount': e.data.poolMissCount || 0,
+                        'protocolFallbackCount': (e.data.protocolFallbackCount || 0) + this.sortProtocolFallbackCount,
+                        'usedLegacyCandidate': !!e.data.usedLegacyCandidate,
+                        'transferFallback': !!e.data.transferFallback
+                    };
+                    this.activeSortRequest = null;
+                    const timingCallbacks = this.activeSortTimingCallbacks;
+                    this.activeSortTimingCallbacks = null;
+                    if (timingCallbacks?.worker === worker && timingCallbacks.onComplete) {
+                        timingCallbacks.onComplete();
+                    }
+                    if (this.sortPromiseResolver) {
+                        this.sortPromiseResolver();
+                        this.sortPromiseResolver = null;
+                    }
                     this.forceRenderNextFrame();
                     if (this.runAfterNextSort.length > 0) {
                         this.runAfterNextSort.forEach((func) => {
@@ -1262,27 +2569,74 @@ export class Viewer {
                         });
                         this.runAfterNextSort.length = 0;
                     }
+                    this.sortAfterPendingTreeRegistration();
                 } else if (e.data.sortCanceled) {
+                    if (this.sortWorker !== worker || this.activeSortRequest?.requestId !== e.data.requestId) return;
                     this.sortRunning = false;
-                } else if (e.data.sortSetupPhase1Complete) {
-                    if (this.logLevel >= LogLevel.Info) console.log('Sorting web worker WASM setup complete.');
-                    if (this.sharedMemoryForWorkers) {
-                        this.sortWorkerSortedIndexes = new Uint32Array(e.data.sortedIndexesBuffer,
-                                                                       e.data.sortedIndexesOffset, maxSplatCount);
-                        this.sortWorkerIndexesToSort = new Uint32Array(e.data.indexesToSortBuffer,
-                                                                       e.data.indexesToSortOffset, maxSplatCount);
-                        this.sortWorkerPrecomputedDistances = new DistancesArrayType(e.data.precomputedDistancesBuffer,
-                                                                                     e.data.precomputedDistancesOffset,
-                                                                                     maxSplatCount);
-                         this.sortWorkerTransforms = new Float32Array(e.data.transformsBuffer,
-                                                                      e.data.transformsOffset, Constants.MaxScenes * 16);
-                    } else {
-                        this.sortWorkerIndexesToSort = new Uint32Array(maxSplatCount);
-                        this.sortWorkerPrecomputedDistances = new DistancesArrayType(maxSplatCount);
-                        this.sortWorkerTransforms = new Float32Array(Constants.MaxScenes * 16);
+                    this.activeSortRequest = null;
+                    const timingCallbacks = this.activeSortTimingCallbacks;
+                    this.activeSortTimingCallbacks = null;
+                    if (timingCallbacks?.worker === worker && timingCallbacks.onCanceled) {
+                        timingCallbacks.onCanceled();
                     }
-                    for (let i = 0; i < splatCount; i++) this.sortWorkerIndexesToSort[i] = i;
-                    this.sortWorker.maxSplatCount = maxSplatCount;
+                    if (this.sortPromiseResolver) {
+                        this.sortPromiseResolver();
+                        this.sortPromiseResolver = null;
+                    }
+                    this.sortAfterPendingTreeRegistration();
+                } else if (e.data.sortError) {
+                    if (e.data.requestId === undefined && !this.sortWorkerReady) {
+                        if (this.sortWorker === worker) {
+                            worker.terminate();
+                            this.sortWorker = null;
+                        }
+                        reject(new Error(e.data.error || 'Sort worker setup failed.'));
+                        return;
+                    }
+                    if (this.sortWorker !== worker || (e.data.requestId !== undefined &&
+                        this.activeSortRequest?.requestId !== e.data.requestId)) return;
+                    this.sortRunning = false;
+                    this.activeSortRequest = null;
+                    this.lastSortMetrics = { 'error': e.data.error || 'Unknown sort worker error.' };
+                    const timingCallbacks = this.activeSortTimingCallbacks;
+                    this.activeSortTimingCallbacks = null;
+                    if (timingCallbacks?.worker === worker && timingCallbacks.onCanceled) timingCallbacks.onCanceled();
+                    if (this.sortPromiseResolver) {
+                        this.sortPromiseResolver();
+                        this.sortPromiseResolver = null;
+                    }
+                    console.error(`Sort worker error: ${e.data.error || 'Unknown error'}`);
+                    this.sortAfterPendingTreeRegistration();
+                } else if (e.data.sortTreeRegistered) {
+                    if (this.sortWorker === worker && e.data.generation === generation &&
+                        e.data.treeGeneration === this.sortWorkerTreeGeneration) {
+                        this.sortWorkerTreeProtocolActive = true;
+                    }
+                } else if (e.data.sortTreeRegistrationError) {
+                    if (this.sortWorker === worker && e.data.generation === generation &&
+                        e.data.treeGeneration === this.sortWorkerTreeGeneration) {
+                        this.sortWorkerTreeProtocolActive = false;
+                        this.sortProtocolFallbackCount++;
+                        try {
+                            worker.postMessage({
+                                'clearSortTree': { 'treeGeneration': this.sortWorkerTreeGeneration }
+                            });
+                        } catch (_) {}
+                        if (this.logLevel >= LogLevel.Warning) {
+                            console.warn(`Compact sort tree was rejected; using the legacy candidate path: ${e.data.error}`);
+                        }
+                    }
+                } else if (e.data.sortSetupPhase1Complete) {
+                    if (this.sortWorker !== worker || e.data.generation !== generation) return;
+                    if (this.logLevel >= LogLevel.Info) console.log('Sorting web worker WASM setup complete.');
+                    this.sortWorkerPrecomputedDistances = new DistancesArrayType(maxSplatCount);
+                    this.sortWorkerTransforms = new Float32Array(Constants.MaxScenes * 16);
+                    worker.maxSplatCount = maxSplatCount;
+                    this.sortWorkerReady = true;
+                    const currentTree = this.splatMesh.getSplatTree();
+                    if (currentTree && this.sortWorkerTree !== currentTree) {
+                        this.registerSortWorkerTree(currentTree);
+                    }
 
                     if (this.logLevel >= LogLevel.Info) {
                         console.log('Sorting web worker ready.');
@@ -1299,6 +2653,124 @@ export class Viewer {
         });
     }
 
+    recycleSortResultBuffer(worker, generation, buffer) {
+        if (!(buffer instanceof ArrayBuffer) || buffer.byteLength === 0 || this.sortWorker !== worker) return;
+        try {
+            worker.postMessage({
+                'recycleSortResult': { generation, buffer }
+            }, [buffer]);
+        } catch (_) {}
+    }
+
+    ensureLegacySortIndexes(count) {
+        if (!this.sortWorkerIndexesToSort || this.sortWorkerIndexesToSort.length < count) {
+            this.sortWorkerIndexesToSort = new Uint32Array(this.splatMesh.getMaxSplatCount());
+        }
+        return this.sortWorkerIndexesToSort;
+    }
+
+    registerSortWorkerTree(splatTree) {
+        const worker = this.sortWorker;
+        if (!worker || this.isDisposingOrDisposed() || this.sortWorkerTree === splatTree) return;
+        if (this.sortRunning) {
+            this.pendingSortWorkerTree = {
+                splatTree,
+                worker,
+                'generation': this.sortWorkerGeneration
+            };
+            return;
+        }
+        this.pendingSortWorkerTree = null;
+        const treeGeneration = ++this.sortWorkerTreeGeneration;
+        this.sortWorkerTree = splatTree;
+        this.sortWorkerTreeNodeIds = splatTree ? new WeakMap() : null;
+        this.sortWorkerTreeProtocolActive = false;
+
+        if (!splatTree) {
+            try {
+                worker.postMessage({ 'clearSortTree': { treeGeneration } });
+            } catch (_) {}
+            return;
+        }
+
+        const nodes = [];
+        let packedIndexCount = 0;
+        for (let subTree of splatTree.subTrees) {
+            for (let node of subTree.nodesWithIndexes) {
+                if (!node.data?.indexes?.length) continue;
+                this.sortWorkerTreeNodeIds.set(node, nodes.length);
+                nodes.push(node);
+                packedIndexCount += node.data.indexes.length;
+            }
+        }
+        const packedIndexes = new Uint32Array(packedIndexCount);
+        const nodeOffsets = new Uint32Array(nodes.length);
+        const nodeCounts = new Uint32Array(nodes.length);
+        let packedOffset = 0;
+        for (let i = 0; i < nodes.length; i++) {
+            const indexes = nodes[i].data.indexes;
+            nodeOffsets[i] = packedOffset;
+            nodeCounts[i] = indexes.length;
+            packedIndexes.set(indexes, packedOffset);
+            packedOffset += indexes.length;
+        }
+
+        const registration = {
+            treeGeneration,
+            'generation': this.sortWorkerGeneration,
+            'packedIndexes': packedIndexes.buffer,
+            'nodeOffsets': nodeOffsets.buffer,
+            'nodeCounts': nodeCounts.buffer
+        };
+        try {
+            worker.postMessage({ 'registerSortTree': registration },
+                               [packedIndexes.buffer, nodeOffsets.buffer, nodeCounts.buffer]);
+            // Worker messages are ordered, so a following sort can use the pool before the acknowledgement arrives.
+            this.sortWorkerTreeProtocolActive = true;
+        } catch (error) {
+            this.sortProtocolFallbackCount++;
+            try {
+                if (packedIndexes.byteLength !== packedIndexCount * Constants.BytesPerInt ||
+                    nodeOffsets.byteLength !== nodes.length * Constants.BytesPerInt ||
+                    nodeCounts.byteLength !== nodes.length * Constants.BytesPerInt) {
+                    throw new Error('Tree registration buffers were detached.');
+                }
+                worker.postMessage({ 'registerSortTree': registration });
+                this.sortWorkerTreeProtocolActive = true;
+            } catch (fallbackError) {
+                this.sortWorkerTreeProtocolActive = false;
+                try {
+                    worker.postMessage({ 'clearSortTree': { treeGeneration } });
+                } catch (_) {}
+                if (this.logLevel >= LogLevel.Warning) {
+                    console.warn(`Compact sort tree registration failed; using the legacy candidate path: ${String(error)}; ` +
+                                 `fallback failed: ${String(fallbackError)}`);
+                }
+            }
+        }
+    }
+
+    registerPendingSortWorkerTree() {
+        if (this.sortRunning || !this.pendingSortWorkerTree) return false;
+        const pending = this.pendingSortWorkerTree;
+        this.pendingSortWorkerTree = null;
+        if (this.sortWorker !== pending.worker || this.sortWorkerGeneration !== pending.generation ||
+            this.splatMesh?.getSplatTree() !== pending.splatTree) return false;
+        this.registerSortWorkerTree(pending.splatTree);
+        return this.sortWorkerTree === pending.splatTree && this.sortWorkerTreeProtocolActive;
+    }
+
+    sortAfterPendingTreeRegistration() {
+        if (!this.registerPendingSortWorkerTree()) return;
+        const worker = this.sortWorker;
+        const tree = this.sortWorkerTree;
+        Promise.resolve().then(() => {
+            if (this.isDisposingOrDisposed() || this.sortRunning || this.sortWorker !== worker ||
+                this.splatMesh?.getSplatTree() !== tree) return;
+            this.runSplatSort(true, true);
+        });
+    }
+
     updateError(error, defaultMessage) {
         if (error instanceof AbortedPromiseError) return error;
         if (error instanceof DirectLoadError) {
@@ -1308,8 +2780,32 @@ export class Viewer {
     }
 
     disposeSortWorker() {
-        if (this.sortWorker) this.sortWorker.terminate();
+        this.sortWorkerGeneration++;
+        const timingCallbacks = this.activeSortTimingCallbacks;
+        this.activeSortTimingCallbacks = null;
+        if (timingCallbacks?.onCanceled) {
+            try {
+                timingCallbacks.onCanceled();
+            } catch (_) {}
+        }
+        if (this.sortWorker) {
+            const cancelTimingProfile = this.sortWorker._cancelTimingProfile;
+            this.sortWorker._cancelTimingProfile = null;
+            if (typeof cancelTimingProfile === 'function') {
+                try {
+                    cancelTimingProfile();
+                } catch (_) {}
+            }
+            this.sortWorker.terminate();
+        }
         this.sortWorker = null;
+        this.sortWorkerReady = false;
+        this.sortWorkerTree = null;
+        this.sortWorkerTreeNodeIds = null;
+        this.sortWorkerTreeProtocolActive = false;
+        this.pendingSortWorkerTree = null;
+        this.activeSortRequest = null;
+        this.sortWorkerIndexesToSort = null;
         this.sortPromise = null;
         if (this.sortPromiseResolver) {
             this.sortPromiseResolver();
@@ -1455,6 +2951,168 @@ export class Viewer {
                 cancelAnimationFrame(this.requestFrameId);
             }
             this.selfDrivenModeRunning = false;
+            this.cancelPendingScreenshotCapture('Screenshot capture was canceled because the Viewer render loop stopped.');
+        }
+    }
+
+    /**
+     * Capture the next complete frame rendered to this Viewer's internally-owned canvas, resampled to the
+     * canvas's CSS display size at the browser's device pixel ratio and composited over opaque black.
+     *
+     * @returns {Promise<Blob>} A promise that resolves to a PNG blob.
+     */
+    captureScreenshot() {
+        if (this.pendingScreenshotCapture) return this.pendingScreenshotCapture.promise;
+
+        if (this.dropInMode || this.usingExternalRenderer) {
+            return Promise.reject(new Error('Screenshots require a Viewer-owned renderer.'));
+        }
+        if (this.webXRMode !== WebXRMode.None || this.webXRActive || this.renderer?.xr?.isPresenting) {
+            return Promise.reject(new Error('Screenshots are unavailable in WebXR mode.'));
+        }
+        if (this.isDisposingOrDisposed()) {
+            return Promise.reject(new Error('Cannot capture a screenshot while the Viewer is being disposed.'));
+        }
+        if (!this.initialized || !this.renderer || !this.renderer.domElement) {
+            return Promise.reject(new Error('Cannot capture a screenshot before the Viewer is initialized.'));
+        }
+        if (!this.splatRenderReady) {
+            return Promise.reject(new Error('Cannot capture a screenshot before the scene is ready to render.'));
+        }
+        if (!this.selfDrivenMode || !this.selfDrivenModeRunning || this.renderMode === RenderMode.Never) {
+            return Promise.reject(new Error('Cannot capture a screenshot while the Viewer render loop is stopped.'));
+        }
+
+        const canvas = this.renderer.domElement;
+
+        let resolveCapture;
+        let rejectCapture;
+        const promise = new Promise((resolve, reject) => {
+            resolveCapture = resolve;
+            rejectCapture = reject;
+        });
+        const capture = {
+            promise,
+            resolve: resolveCapture,
+            reject: rejectCapture,
+            timeoutId: undefined,
+            encoding: false,
+            canvas
+        };
+        capture.timeoutId = window.setTimeout(() => {
+            this.cancelPendingScreenshotCapture('Screenshot capture timed out.');
+        }, SCREENSHOT_CAPTURE_TIMEOUT_MS);
+        this.pendingScreenshotCapture = capture;
+        this.forceRenderNextFrame();
+        return promise;
+    }
+
+    /**
+     * Run an isolated, reversible render-performance diagnosis on the currently visible splat scene.
+     * The diagnosis is only safe for a running, self-driven Viewer with its internally-owned renderer.
+     *
+     * @param {object} options Sampling counts, wait timeouts, and an optional onProgress callback.
+     * @returns {Promise<object>} The structured diagnostic report.
+     */
+    runRenderPerformanceDiagnostic(options = {}) {
+        if (this.renderPerformanceDiagnosticPromise) return this.renderPerformanceDiagnosticPromise;
+        const diagnosticPromise = runRenderPerformanceDiagnostic(this, options)
+            .then((report) => {
+                this.lastRenderPerformanceDiagnostic = report;
+                return report;
+            })
+            .finally(() => {
+                if (this.renderPerformanceDiagnosticPromise === diagnosticPromise) {
+                    this.renderPerformanceDiagnosticPromise = null;
+                }
+            });
+        this.renderPerformanceDiagnosticPromise = diagnosticPromise;
+        return diagnosticPromise;
+    }
+
+    cancelPendingScreenshotCapture(reason) {
+        const capture = this.pendingScreenshotCapture;
+        if (!capture) return;
+
+        this.pendingScreenshotCapture = null;
+        if (capture.timeoutId !== undefined) window.clearTimeout(capture.timeoutId);
+        capture.reject(new Error(reason || 'Screenshot capture was canceled.'));
+    }
+
+    capturePendingScreenshotAtRenderTail() {
+        const capture = this.pendingScreenshotCapture;
+        if (!capture || capture.encoding) return;
+
+        if (!this.renderer || this.renderer.domElement !== capture.canvas || this.isDisposingOrDisposed()) {
+            this.cancelPendingScreenshotCapture('Screenshot capture was canceled because the Viewer is unavailable.');
+            return;
+        }
+
+        capture.encoding = true;
+        try {
+            if (typeof capture.canvas.getBoundingClientRect !== 'function') {
+                throw new Error('The screenshot canvas CSS content area cannot be measured.');
+            }
+            const rect = capture.canvas.getBoundingClientRect();
+            if (!rect || !Number.isFinite(rect.width) || !Number.isFinite(rect.height) || rect.width <= 0 || rect.height <= 0) {
+                throw new Error('The screenshot canvas has no measurable CSS content area.');
+            }
+            if (!Number.isFinite(capture.canvas.width) || !Number.isFinite(capture.canvas.height) ||
+                capture.canvas.width <= 0 || capture.canvas.height <= 0) {
+                throw new Error('The screenshot source bitmap has no pixels.');
+            }
+
+            const browserDevicePixelRatio = Number(window.devicePixelRatio);
+            const outputDevicePixelRatio = Number.isFinite(browserDevicePixelRatio) && browserDevicePixelRatio > 0 ?
+                browserDevicePixelRatio : 1;
+            const targetWidth = Math.max(1, Math.round(rect.width * outputDevicePixelRatio));
+            const targetHeight = Math.max(1, Math.round(rect.height * outputDevicePixelRatio));
+            if (!Number.isFinite(targetWidth) || !Number.isFinite(targetHeight) || targetWidth <= 0 || targetHeight <= 0) {
+                throw new Error('The screenshot output dimensions are unavailable.');
+            }
+
+            const ownerDocument = capture.canvas.ownerDocument;
+            if (!ownerDocument || typeof ownerDocument.createElement !== 'function') {
+                throw new Error('A temporary screenshot canvas could not be created.');
+            }
+            const outputCanvas = ownerDocument.createElement('canvas');
+            outputCanvas.width = targetWidth;
+            outputCanvas.height = targetHeight;
+            if (outputCanvas.width !== targetWidth || outputCanvas.height !== targetHeight) {
+                throw new Error('The screenshot output dimensions are unsupported by this browser.');
+            }
+            const outputContext = outputCanvas.getContext('2d');
+            if (!outputContext) {
+                throw new Error('A 2D context for the screenshot could not be created.');
+            }
+            if (typeof outputCanvas.toBlob !== 'function') {
+                throw new Error('PNG screenshot encoding is unavailable in this browser.');
+            }
+
+            outputContext.fillStyle = '#000000';
+            outputContext.fillRect(0, 0, targetWidth, targetHeight);
+            outputContext.imageSmoothingEnabled = true;
+            if ('imageSmoothingQuality' in outputContext) outputContext.imageSmoothingQuality = 'high';
+            outputContext.drawImage(capture.canvas, 0, 0, capture.canvas.width, capture.canvas.height,
+                                    0, 0, targetWidth, targetHeight);
+
+            outputCanvas.toBlob((blob) => {
+                if (this.pendingScreenshotCapture !== capture) return;
+
+                this.pendingScreenshotCapture = null;
+                if (capture.timeoutId !== undefined) window.clearTimeout(capture.timeoutId);
+                if (blob instanceof Blob) {
+                    capture.resolve(blob);
+                } else {
+                    capture.reject(new Error('The browser could not encode the screenshot as PNG.'));
+                }
+            }, 'image/png');
+        } catch (error) {
+            if (this.pendingScreenshotCapture !== capture) return;
+            this.pendingScreenshotCapture = null;
+            if (capture.timeoutId !== undefined) window.clearTimeout(capture.timeoutId);
+            const detail = error?.message ? `: ${error.message}` : '';
+            capture.reject(new Error(`The browser could not prepare or encode the screenshot as PNG${detail}`));
         }
     }
 
@@ -1463,6 +3121,10 @@ export class Viewer {
      */
     async dispose() {
         if (this.isDisposingOrDisposed()) return this.disposePromise;
+
+        this.cancelPendingScreenshotCapture('Screenshot capture was canceled because the Viewer is being disposed.');
+        this.afterFirstVisibleFrameCallbacks.length = 0;
+        this.cancelTimingReportSession('Viewer disposed during timing collection.');
 
         let waitPromises = [];
         let promisesToAbort = [];
@@ -1498,9 +3160,10 @@ export class Viewer {
                 this.sceneHelper = null;
             }
             if (this.resizeObserver) {
-                this.resizeObserver.unobserve(this.rootElement);
+                this.resizeObserver.disconnect();
                 this.resizeObserver = null;
             }
+            this.resizeRendererToObservedDimensions = null;
             this.disposeSortWorker();
             this.removeEventHandlers();
 
@@ -1522,11 +3185,10 @@ export class Viewer {
                 this.renderer = null;
             }
 
-            if (!this.usingExternalRenderer) {
-                document.body.removeChild(this.rootElement);
+            if (this.ownsRootElement && this.rootElement.parentElement) {
+                this.rootElement.parentElement.removeChild(this.rootElement);
             }
 
-            this.sortWorkerSortedIndexes = null;
             this.sortWorkerIndexesToSort = null;
             this.sortWorkerPrecomputedDistances = null;
             this.sortWorkerTransforms = null;
@@ -1614,10 +3276,17 @@ export class Viewer {
                 this.renderer.autoClear = false;
             }
             this.renderer.render(this.splatMesh, this.camera);
+            this.renderCount++;
             this.renderer.autoClear = false;
             if (this.sceneHelper.getFocusMarkerOpacity() > 0.0) this.renderer.render(this.sceneHelper.focusMarker, this.camera);
             if (this.showControlPlane) this.renderer.render(this.sceneHelper.controlPlane, this.camera);
             this.renderer.autoClear = savedAuoClear;
+            this.capturePendingScreenshotAtRenderTail();
+            // A render() call only submits commands. Defer the timing point and
+            // processing-spinner removal until the following animation frame,
+            // after this frame had an opportunity to be painted to the screen.
+            this.scheduleFirstVisibleFrameObservation(this.currentMeshIsPreview ? 'partial' : 'full');
+            this.scheduleFullVisibleFrameObservation();
         };
 
     }();
@@ -1804,22 +3473,36 @@ export class Viewer {
     updateInfoPanel = function() {
 
         const renderDimensions = new THREE.Vector2();
+        const renderResolution = new THREE.Vector2();
 
         return function() {
             if (!this.showInfo) return;
+            const currentTime = performance.now();
+            if (this.lastInfoPanelUpdateTime !== null &&
+                currentTime - this.lastInfoPanelUpdateTime < INFO_PANEL_UPDATE_INTERVAL_MS) return;
+            this.lastInfoPanelUpdateTime = currentTime;
             const splatCount = this.splatMesh.getSplatCount();
             this.getRenderDimensions(renderDimensions);
+            this.renderer.getDrawingBufferSize(renderResolution);
             const cameraLookAtPosition = this.controls ? this.controls.target : null;
             const meshCursorPosition = this.showMeshCursor ? this.sceneHelper.meshCursor.position : null;
             const splatRenderCountPct = splatCount > 0 ? this.splatRenderCount / splatCount * 100 : 0;
-            this.infoPanel.update(renderDimensions, this.camera.position, cameraLookAtPosition,
+            this.infoPanel.update(renderDimensions, renderResolution, this.camera.position, cameraLookAtPosition,
                                   this.camera.up, this.camera.isOrthographicCamera, meshCursorPosition,
                                   this.currentFPS || 'N/A', splatCount, this.splatRenderCount, splatRenderCountPct,
                                   this.lastSortTime, this.focalAdjustment, this.splatMesh.getSplatScale(),
                                   this.splatMesh.getPointCloudModeEnabled());
+            this.infoPanel.setFirstFrameTime(this.firstFrameLabel, this.firstFrameElapsedMs);
         };
 
     }();
+
+    setFirstFrameLabel(label) {
+        this.firstFrameLabel = label;
+        if (this.infoPanel) {
+            this.infoPanel.setFirstFrameTime(this.firstFrameLabel, this.firstFrameElapsedMs);
+        }
+    }
 
     updateControlPlane() {
         if (this.showControlPlane) {
@@ -1855,9 +3538,10 @@ export class Viewer {
             }
         ];
 
-        return function(force = false, forceSortAll = false) {
+        return function(force = false, forceSortAll = false, onComplete = null, onCanceled = null) {
             if (!this.initialized) return Promise.resolve(false);
             if (this.sortRunning) return Promise.resolve(true);
+            if (!this.sortWorker || !this.sortWorkerReady) return Promise.resolve(false);
             if (this.splatMesh.getSplatCount() <= 0) {
                 this.splatRenderCount = 0;
                 return Promise.resolve(false);
@@ -1869,19 +3553,21 @@ export class Viewer {
             let needsRefreshForPosition = false;
 
             sortViewDir.set(0, 0, -1).applyQuaternion(this.camera.quaternion);
-            angleDiff = sortViewDir.dot(lastSortViewDir);
+            angleDiff = Math.acos(clamp(sortViewDir.dot(lastSortViewDir), -1, 1));
             positionDiff = sortViewOffset.copy(this.camera.position).sub(lastSortViewPos).length();
 
             if (!force) {
                 if (!this.splatMesh.dynamicMode && queuedSorts.length === 0) {
-                    if (angleDiff <= 0.99) needsRefreshForRotation = true;
-                    if (positionDiff >= 1.0) needsRefreshForPosition = true;
+                    if (angleDiff >= this.splatSortRotationThreshold) needsRefreshForRotation = true;
+                    if (positionDiff >= this.splatSortPositionThreshold) needsRefreshForPosition = true;
                     if (!needsRefreshForRotation && !needsRefreshForPosition) return Promise.resolve(false);
                 }
             }
 
             this.sortRunning = true;
-            let { splatRenderCount, shouldSortAll } = this.gatherSceneNodesForSort();
+            const worker = this.sortWorker;
+            let candidateSelection = this.gatherSceneNodesForSort();
+            let { splatRenderCount, shouldSortAll } = candidateSelection;
             shouldSortAll = shouldSortAll || forceSortAll;
             this.splatRenderCount = splatRenderCount;
 
@@ -1896,12 +3582,22 @@ export class Viewer {
             }
 
             gpuAcceleratedSortPromise.then(() => {
+                if (this.sortWorker !== worker || !this.sortWorkerReady) {
+                    this.sortRunning = false;
+                    return false;
+                }
+                if (candidateSelection.treeGeneration !== this.sortWorkerTreeGeneration) {
+                    candidateSelection = this.gatherSceneNodesForSort();
+                    this.splatRenderCount = candidateSelection.splatRenderCount;
+                    shouldSortAll = candidateSelection.shouldSortAll || forceSortAll;
+                }
                 if (queuedSorts.length === 0) {
-                    if (this.splatMesh.dynamicMode || shouldSortAll) {
+                    if (this.splatMesh.dynamicMode || shouldSortAll || !this.enableProgressiveSort) {
                         queuedSorts.push(this.splatRenderCount);
                     } else {
-                            for (let partialSort of partialSorts) {
-                            if (angleDiff < partialSort.angleThreshold) {
+                        const angleDiffDot = Math.cos(angleDiff);
+                        for (let partialSort of partialSorts) {
+                            if (angleDiffDot < partialSort.angleThreshold) {
                                 for (let sortFraction of partialSort.sortFractions) {
                                     queuedSorts.push(Math.floor(this.splatRenderCount * sortFraction));
                                 }
@@ -1923,32 +3619,86 @@ export class Viewer {
                     'cameraPosition': cameraPositionArray,
                     'splatRenderCount': this.splatRenderCount,
                     'splatSortCount': sortCount,
-                    'usePrecomputedDistances': this.gpuAcceleratedSort
+                    'usePrecomputedDistances': this.gpuAcceleratedSort,
+                    'requestId': ++this.sortRequestId,
+                    'generation': this.sortWorkerGeneration,
+                    'treeGeneration': this.sortWorkerTreeGeneration,
+                    'candidateMode': candidateSelection.candidateMode
                 };
                 if (this.splatMesh.dynamicMode) {
                     this.splatMesh.fillTransformsArray(this.sortWorkerTransforms);
                 }
-                if (!this.sharedMemoryForWorkers) {
-                    sortMessage.indexesToSort = this.sortWorkerIndexesToSort;
-                    sortMessage.transforms = this.sortWorkerTransforms;
-                    if (this.gpuAcceleratedSort) {
-                        sortMessage.precomputedDistances = this.sortWorkerPrecomputedDistances;
-                    }
+                sortMessage.transforms = this.sortWorkerTransforms;
+                if (candidateSelection.indexesToSort) {
+                    sortMessage.indexesToSort = candidateSelection.indexesToSort;
+                } else if (candidateSelection.orderedNodeIds) {
+                    sortMessage.orderedNodeIds = candidateSelection.orderedNodeIds;
+                }
+                if (this.gpuAcceleratedSort) {
+                    sortMessage.precomputedDistances = this.sortWorkerPrecomputedDistances;
                 }
 
                 this.sortPromise = new Promise((resolve) => {
                     this.sortPromiseResolver = resolve;
                 });
+                this.activeSortTimingCallbacks = {
+                    worker,
+                    'onComplete': typeof onComplete === 'function' ? onComplete : null,
+                    'onCanceled': typeof onCanceled === 'function' ? onCanceled : null
+                };
+                this.activeSortRequest = {
+                    'requestId': sortMessage.requestId,
+                    'generation': sortMessage.generation,
+                    'treeGeneration': sortMessage.treeGeneration,
+                    'dispatchedAt': performance.now()
+                };
 
                 if (this.preSortMessages.length > 0) {
                     this.preSortMessages.forEach((message) => {
-                        this.sortWorker.postMessage(message);
+                        worker.postMessage(message);
                     });
                     this.preSortMessages = [];
                 }
-                this.sortWorker.postMessage({
-                    'sort': sortMessage
-                });
+                const message = { 'sort': sortMessage };
+                const transferList = candidateSelection.orderedNodeIds ?
+                    [candidateSelection.orderedNodeIds.buffer] : [];
+                try {
+                    worker.postMessage(message, transferList);
+                } catch (transferError) {
+                    this.sortProtocolFallbackCount++;
+                    try {
+                        if (sortMessage.orderedNodeIds?.byteLength === 0) {
+                            candidateSelection = this.gatherSceneNodesForSort();
+                            sortMessage.splatRenderCount = candidateSelection.splatRenderCount;
+                            sortMessage.splatSortCount = Math.min(sortCount, candidateSelection.splatRenderCount);
+                            sortMessage.treeGeneration = candidateSelection.treeGeneration;
+                            sortMessage.candidateMode = candidateSelection.candidateMode;
+                            delete sortMessage.orderedNodeIds;
+                            delete sortMessage.indexesToSort;
+                            if (candidateSelection.indexesToSort) {
+                                sortMessage.indexesToSort = candidateSelection.indexesToSort;
+                            } else if (candidateSelection.orderedNodeIds) {
+                                sortMessage.orderedNodeIds = candidateSelection.orderedNodeIds;
+                            }
+                            this.activeSortRequest.treeGeneration = sortMessage.treeGeneration;
+                        }
+                        worker.postMessage(message);
+                    } catch (fallbackError) {
+                        this.sortRunning = false;
+                        this.activeSortRequest = null;
+                        const timingCallbacks = this.activeSortTimingCallbacks;
+                        this.activeSortTimingCallbacks = null;
+                        if (timingCallbacks?.onCanceled) timingCallbacks.onCanceled();
+                        if (this.sortPromiseResolver) {
+                            this.sortPromiseResolver();
+                            this.sortPromiseResolver = null;
+                        }
+                        console.error(`Unable to dispatch sort: ${String(transferError)}; ` +
+                                      `fallback failed: ${String(fallbackError)}`);
+                        this.sortAfterPendingTreeRegistration();
+                        return false;
+                    }
+                }
 
                 if (queuedSorts.length === 0) {
                     lastSortViewPos.copy(this.camera.position);
@@ -1969,35 +3719,117 @@ export class Viewer {
     gatherSceneNodesForSort = function() {
 
         const nodeRenderList = [];
-        let allSplatsSortBuffer = null;
-        const tempVectorYZ = new THREE.Vector3();
-        const tempVectorXZ = new THREE.Vector3();
         const tempVector = new THREE.Vector3();
         const modelView = new THREE.Matrix4();
         const baseModelView = new THREE.Matrix4();
         const sceneTransform = new THREE.Matrix4();
-        const renderDimensions = new THREE.Vector3();
-        const forward = new THREE.Vector3(0, 0, -1);
+        const localToWorld = new THREE.Matrix4();
+        const inverseLocalToWorld = new THREE.Matrix4();
+        const expandedProjection = new THREE.Matrix4();
+        const projectionModelView = new THREE.Matrix4();
+        const localFrustum = new THREE.Frustum();
+        const expandedNodeBounds = new THREE.Box3();
+        const localMovementMargin = new THREE.Vector3();
+        const aabbPositiveVertex = new THREE.Vector3();
 
-        const tempMax = new THREE.Vector3();
-        const nodeSize = (node) => {
-            return tempMax.copy(node.max).sub(node.min).length();
+        // The vertex shader performs its early center rejection against a 1.2-wide clip-space box.
+        const gpuCenterClipExpansion = 1.2;
+        const configureExpandedProjection = (camera, rotationThreshold) => {
+            // A finite rotation-safe expansion for an orthographic volume depends on scene depth. Retain all nodes
+            // for orthographic cameras rather than risk culling a node that can enter during the sort hysteresis.
+            if (camera.isOrthographicCamera) return false;
+
+            expandedProjection.copy(camera.projectionMatrix);
+            const elements = expandedProjection.elements;
+            // Off-axis and non-perspective custom projections fall back to retaining all nodes. Scaling their clip
+            // rows about zero could otherwise make one side of the frustum narrower.
+            if (!elements.every(Number.isFinite) || Math.abs(elements[15]) > 1e-7 ||
+                Math.abs(elements[8]) > 1e-7 || Math.abs(elements[9]) > 1e-7 ||
+                Math.abs(elements[0]) < 1e-7 || Math.abs(elements[5]) < 1e-7 ||
+                !Number.isFinite(rotationThreshold) || rotationThreshold < 0) {
+                return false;
+            }
+
+            const baseHalfFovX = Math.atan(1.0 / Math.abs(elements[0]));
+            const baseHalfFovY = Math.atan(1.0 / Math.abs(elements[5]));
+            // Sorting is triggered from the camera forward vector, so a pure camera roll does not request a new sort.
+            // Use the shader's expanded screen diagonal as a rotation-invariant envelope for either side axis.
+            const shaderHalfExtentX = gpuCenterClipExpansion * Math.tan(baseHalfFovX);
+            const shaderHalfExtentY = gpuCenterClipExpansion * Math.tan(baseHalfFovY);
+            const rollSafeHalfFov = Math.atan(Math.hypot(shaderHalfExtentX, shaderHalfExtentY));
+            const expandedHalfFovX = rollSafeHalfFov + rotationThreshold;
+            const expandedHalfFovY = rollSafeHalfFov + rotationThreshold;
+            if (expandedHalfFovX >= Math.PI * 0.5 || expandedHalfFovY >= Math.PI * 0.5) return false;
+
+            const clipScaleX = Math.tan(baseHalfFovX) / Math.tan(expandedHalfFovX);
+            const clipScaleY = Math.tan(baseHalfFovY) / Math.tan(expandedHalfFovY);
+            if (!(clipScaleX > 0) || !(clipScaleY > 0)) return false;
+
+            elements[0] *= clipScaleX;
+            elements[4] *= clipScaleX;
+            elements[8] *= clipScaleX;
+            elements[12] *= clipScaleX;
+            elements[1] *= clipScaleY;
+            elements[5] *= clipScaleY;
+            elements[9] *= clipScaleY;
+            elements[13] *= clipScaleY;
+            return true;
+        };
+
+        const calculateLocalMovementMargin = (transform, worldMargin, outMargin) => {
+            if (!Number.isFinite(worldMargin) || worldMargin < 0) return false;
+            if (worldMargin === 0) {
+                outMargin.set(0, 0, 0);
+                return true;
+            }
+
+            const determinant = transform.determinant();
+            if (!Number.isFinite(determinant) || Math.abs(determinant) < 1e-12) return false;
+            inverseLocalToWorld.copy(transform).invert();
+            const elements = inverseLocalToWorld.elements;
+            if (!elements.every(Number.isFinite)) return false;
+
+            // Each row norm bounds the corresponding local-coordinate displacement caused by any world-space
+            // camera translation within the sort hysteresis radius, including non-uniform scene scaling.
+            outMargin.set(
+                worldMargin * Math.hypot(elements[0], elements[4], elements[8]),
+                worldMargin * Math.hypot(elements[1], elements[5], elements[9]),
+                worldMargin * Math.hypot(elements[2], elements[6], elements[10])
+            );
+            return Number.isFinite(outMargin.x) && Number.isFinite(outMargin.y) && Number.isFinite(outMargin.z);
+        };
+
+        const frustumSidePlanesAreFinite = (frustum) => {
+            return frustum.planes.slice(0, 4).every((plane) => Number.isFinite(plane.constant) &&
+                Number.isFinite(plane.normal.x) && Number.isFinite(plane.normal.y) && Number.isFinite(plane.normal.z));
+        };
+
+        const intersectsFrustumSidePlanes = (box, frustum) => {
+            // Only reject against left/right/top/bottom. Near/far can change under the permitted camera rotation,
+            // so retaining depth candidates prevents a node crossing either depth plane before the next sort.
+            for (let i = 0; i < 4; i++) {
+                const plane = frustum.planes[i];
+                aabbPositiveVertex.set(
+                    plane.normal.x > 0 ? box.max.x : box.min.x,
+                    plane.normal.y > 0 ? box.max.y : box.min.y,
+                    plane.normal.z > 0 ? box.max.z : box.min.z
+                );
+                if (plane.distanceToPoint(aabbPositiveVertex) < 0) return false;
+            }
+            return true;
         };
 
         return function(gatherAllNodes = false) {
-
-            this.getRenderDimensions(renderDimensions);
-            const cameraFocalLength = (renderDimensions.y / 2.0) / Math.tan(this.camera.fov / 2.0 * THREE.MathUtils.DEG2RAD);
-            const fovXOver2 = Math.atan(renderDimensions.x / 2.0 / cameraFocalLength);
-            const fovYOver2 = Math.atan(renderDimensions.y / 2.0 / cameraFocalLength);
-            const cosFovXOver2 = Math.cos(fovXOver2);
-            const cosFovYOver2 = Math.cos(fovYOver2);
 
             const splatTree = this.splatMesh.getSplatTree();
 
             if (splatTree) {
                 baseModelView.copy(this.camera.matrixWorld).invert();
                 if (!this.splatMesh.dynamicMode) baseModelView.multiply(this.splatMesh.matrixWorld);
+                const rotationThreshold = Number(this.splatSortRotationThreshold);
+                const worldMovementMargin = Number(this.splatSortPositionThreshold);
+                const expandedProjectionAvailable = !gatherAllNodes &&
+                    configureExpandedProjection(this.camera, rotationThreshold);
 
                 let nodeRenderCount = 0;
                 let splatRenderCount = 0;
@@ -2008,28 +3840,29 @@ export class Viewer {
                     if (this.splatMesh.dynamicMode) {
                         this.splatMesh.getSceneTransform(s, sceneTransform);
                         modelView.multiply(sceneTransform);
+                        localToWorld.copy(sceneTransform);
+                    } else {
+                        localToWorld.copy(this.splatMesh.matrixWorld);
+                    }
+                    let canCullScene = expandedProjectionAvailable &&
+                                       calculateLocalMovementMargin(localToWorld, worldMovementMargin,
+                                                                    localMovementMargin);
+                    if (canCullScene) {
+                        projectionModelView.multiplyMatrices(expandedProjection, modelView);
+                        localFrustum.setFromProjectionMatrix(projectionModelView);
+                        canCullScene = frustumSidePlanesAreFinite(localFrustum);
                     }
                     const nodeCount = subTree.nodesWithIndexes.length;
                     for (let i = 0; i < nodeCount; i++) {
                         const node = subTree.nodesWithIndexes[i];
                         if (!node.data || !node.data.indexes || node.data.indexes.length === 0) continue;
+                        if (canCullScene && node.boundingBox && !node.boundingBox.isEmpty()) {
+                            expandedNodeBounds.copy(node.boundingBox).expandByVector(localMovementMargin);
+                            if (!intersectsFrustumSidePlanes(expandedNodeBounds, localFrustum)) continue;
+                        }
                         tempVector.copy(node.center).applyMatrix4(modelView);
 
                         const distanceToNode = tempVector.length();
-                        tempVector.normalize();
-
-                        tempVectorYZ.copy(tempVector).setX(0).normalize();
-                        tempVectorXZ.copy(tempVector).setY(0).normalize();
-
-                        const cameraAngleXZDot = forward.dot(tempVectorXZ);
-                        const cameraAngleYZDot = forward.dot(tempVectorYZ);
-
-                        const ns = nodeSize(node);
-                        const outOfFovY = cameraAngleYZDot < (cosFovYOver2 - .6);
-                        const outOfFovX = cameraAngleXZDot < (cosFovXOver2 - .6);
-                        if (!gatherAllNodes && ((outOfFovX || outOfFovY) && distanceToNode > ns)) {
-                            continue;
-                        }
                         splatRenderCount += node.data.indexes.length;
                         nodeRenderList[nodeRenderCount] = node;
                         node.data.distanceToNode = distanceToNode;
@@ -2043,33 +3876,49 @@ export class Viewer {
                     else return 1;
                 });
 
-                let currentByteOffset = splatRenderCount * Constants.BytesPerInt;
-                for (let i = 0; i < nodeRenderCount; i++) {
-                    const node = nodeRenderList[i];
-                    const windowSizeInts = node.data.indexes.length;
-                    const windowSizeBytes = windowSizeInts * Constants.BytesPerInt;
-                    let destView = new Uint32Array(this.sortWorkerIndexesToSort.buffer,
-                                                   currentByteOffset - windowSizeBytes, windowSizeInts);
-                    destView.set(node.data.indexes);
-                    currentByteOffset -= windowSizeBytes;
+                let compactTreeAvailable = this.sortWorkerTree === splatTree &&
+                                           this.sortWorkerTreeProtocolActive &&
+                                           !!this.sortWorkerTreeNodeIds;
+                const orderedNodeIds = compactTreeAvailable ? new Uint32Array(nodeRenderCount) : null;
+                if (orderedNodeIds) {
+                    for (let i = 0; i < nodeRenderCount; i++) {
+                        const nodeId = this.sortWorkerTreeNodeIds.get(nodeRenderList[i]);
+                        if (nodeId === undefined) {
+                            compactTreeAvailable = false;
+                            break;
+                        }
+                        orderedNodeIds[i] = nodeId;
+                    }
                 }
 
+                let indexesToSort = null;
+                if (!compactTreeAvailable) {
+                    this.sortProtocolFallbackCount++;
+                    indexesToSort = this.ensureLegacySortIndexes(splatRenderCount);
+                    let currentIndexOffset = splatRenderCount;
+                    for (let i = 0; i < nodeRenderCount; i++) {
+                        const indexes = nodeRenderList[i].data.indexes;
+                        currentIndexOffset -= indexes.length;
+                        indexesToSort.set(indexes, currentIndexOffset);
+                    }
+                }
                 return {
                     'splatRenderCount': splatRenderCount,
-                    'shouldSortAll': false
+                    'shouldSortAll': false,
+                    'candidateMode': compactTreeAvailable ? 'tree' : 'legacy',
+                    'orderedNodeIds': compactTreeAvailable ? orderedNodeIds : null,
+                    indexesToSort,
+                    'treeGeneration': this.sortWorkerTreeGeneration
                 };
             } else {
                 const totalSplatCount = this.splatMesh.getSplatCount();
-                if (!allSplatsSortBuffer || allSplatsSortBuffer.length !== totalSplatCount) {
-                    allSplatsSortBuffer = new Uint32Array(totalSplatCount);
-                    for (let i = 0; i < totalSplatCount; i++) {
-                        allSplatsSortBuffer[i] = i;
-                    }
-                }
-                this.sortWorkerIndexesToSort.set(allSplatsSortBuffer);
                 return {
                     'splatRenderCount': totalSplatCount,
-                    'shouldSortAll': true
+                    'shouldSortAll': true,
+                    'candidateMode': 'identity',
+                    'orderedNodeIds': null,
+                    'indexesToSort': null,
+                    'treeGeneration': this.sortWorkerTreeGeneration
                 };
             }
         };
