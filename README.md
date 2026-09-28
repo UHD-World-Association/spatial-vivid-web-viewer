@@ -18,7 +18,7 @@
 
 ## 快速开始
 
-已具备完整前端依赖和所需 WASM 部署产物时，下载数据集于此[链接](https://theuwa.com/tech/SpatialVivid/dataset.zip)，解压后放置于demo/assets下。本仓库中使用的示例和测试资源，是由我们利用以下公开数据集中的精选场景或图像训练而成的：[Deep Blending](http://visual.cs.ucl.ac.uk/pubs/deepblending/)与[Mip-NeRF 360](https://jonbarron.info/mipnerf360/)
+已具备完整前端依赖和所需 WASM 部署产物时，下载数据集于此[链接](https://theuwa.com/tech/SpatialVivid/dataset_20260928_1.zip)，解压后放置于demo/assets下。本仓库中使用的示例和测试资源，是由我们利用以下公开数据集中的精选场景或图像训练而成的：[Deep Blending](http://visual.cs.ucl.ac.uk/pubs/deepblending/)与[Mip-NeRF 360](https://jonbarron.info/mipnerf360/)
 
 在仓库根目录执行：
 

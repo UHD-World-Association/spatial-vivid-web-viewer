@@ -18,7 +18,7 @@ The frontend requires a network-enabled smartphone, which accesses the public UR
 
 ## Quick Start
 
-When the frontend dependencies and complete WASM deployment artifacts are available,Download the dataset from this [link](https://theuwa.com/tech/SpatialVivid/dataset.zip), unzip it, and place it in the `demo/assets` directory. The examples and test assets used in this repository were trained by us using selected scenes/images from the following publicly available datasets: [Deep Blending Dataset](http://visual.cs.ucl.ac.uk/pubs/deepblending/) and [Mip-NeRF 360 Dataset](https://jonbarron.info/mipnerf360/)  run these commands from the repository root:
+When the frontend dependencies and complete WASM deployment artifacts are available,Download the dataset from this [link](https://theuwa.com/tech/SpatialVivid/dataset_20260928_1.zip), unzip it, and place it in the `demo/assets` directory. The examples and test assets used in this repository were trained by us using selected scenes/images from the following publicly available datasets: [Deep Blending Dataset](http://visual.cs.ucl.ac.uk/pubs/deepblending/) and [Mip-NeRF 360 Dataset](https://jonbarron.info/mipnerf360/)  run these commands from the repository root:
 
 ```bash
 npm install

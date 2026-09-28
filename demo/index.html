@@ -347,6 +347,30 @@
       margin-right: 8px;
     }
 
+    .viewer-controls-row {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+      max-width: 1020px;
+      margin: auto;
+      align-items: stretch;
+    }
+
+    .viewer-controls-row > .splat-panel {
+      box-sizing: border-box;
+      width: 100%;
+      max-width: none;
+      min-width: 0;
+      min-height: 490px;
+      height: auto;
+      margin: 0;
+      overflow-wrap: anywhere;
+    }
+
+    .viewer-controls-row table {
+      width: 100%;
+    }
+
     .loading-icon {
         width: 35px;
         padding: 15px;
@@ -410,6 +434,13 @@
     }
 
     @media (max-width: 740px){
+        .viewer-controls-row {
+          grid-template-columns: minmax(0, 1fr);
+        }
+
+        .viewer-controls-row > .splat-panel {
+          min-height: 0;
+        }
   
         .demo-scene-panel {
             width: 340px;
@@ -1873,8 +1904,8 @@
     </div>
     <br>
     <div class="header-content-container">
-        <div class="content-row">
-            <div id ="view-panel" class="splat-panel" style="min-height:400px; height:auto;">
+        <div class="content-row viewer-controls-row">
+            <div id ="view-panel" class="splat-panel">
                 <br>
                 <div class="small-title">View a <span class="file-ext">.ply</span>, <span class="file-ext">.glb</span>, <span class="file-ext">.ksplat</span>, or <span class="file-ext-small">.splat</span> file</div>
                 <label for="bc-texture-path-enabled" style="display:block; margin-bottom:5px;">
@@ -2001,7 +2032,7 @@
             </div>
       
 
-            <div id ="controls-panel" class="splat-panel" style="height:490px;">
+            <div id ="controls-panel" class="splat-panel">
 
                 <br>
                 <span class="small-title">Mouse input</span>
@@ -2092,10 +2123,10 @@
 
 <script>
    document.body.onload = function () {
-    let initialRenderDpr = 1;
+    let initialRenderDpr = 2;
     try {
       if (Number.isFinite(window.devicePixelRatio) && window.devicePixelRatio > 0) {
-        initialRenderDpr = 1;
+        initialRenderDpr = 2;
       }
     } catch (_) {}
     document.getElementById('devicePixelRatioView').value = String(initialRenderDpr);
