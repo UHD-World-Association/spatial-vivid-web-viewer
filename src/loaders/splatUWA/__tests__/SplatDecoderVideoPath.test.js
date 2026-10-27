@@ -43,10 +43,14 @@ test('worker compaction keeps every attribute and compressed UV in one stable po
     assert.deepEqual(Array.from(model.positions), [10, 11, 12, 20, 21, 22]);
     assert.deepEqual(Array.from(model.colors), [4, 5, 6, 2, 7, 8, 9, 1]);
     assert.deepEqual(Array.from(model.compressedTextureData.uvs), [10, 11, 20, 21]);
-    assert.deepEqual(model.gpuScaleRotations, new Float32Array([
-        2, 2, 2, .1, .2, .3,
-        3, 3, 3, .4, .5, .6
-    ]));
+    for (let point = 0; point < 2; point++) {
+        const length = Math.hypot(...model.rotations.subarray(point * 4, point * 4 + 4));
+        assert.deepEqual([...model.gpuScaleRotations.subarray(point * 6, point * 6 + 3)], [point + 2, point + 2, point + 2]);
+        for (let channel = 0; channel < 3; channel++) {
+            assert.ok(Math.abs(model.gpuScaleRotations[point * 6 + 3 + channel] -
+                model.rotations[point * 4 + 1 + channel] / length) < 1e-7);
+        }
+    }
     assert.equal(model.gpuScaleRotations.length, 2 * 6);
     assert.deepEqual(Array.from(model.gpuCenterColors), [
         0x02060504, 0x41200000, 0x41300000, 0x41400000,
@@ -115,7 +119,10 @@ test('worker scale/rotation input uses bounded texture padding and keeps WXYZ-de
     buildGpuScaleRotations(model);
 
     assert.equal(model.gpuScaleRotations.length, 8192 * 4);
-    assert.deepEqual(Array.from(model.gpuScaleRotations.subarray(0, 6)),
-        Array.from(new Float32Array([2, 3, 4, .1, .2, .3])));
+    assert.deepEqual([...model.gpuScaleRotations.subarray(0, 3)], [2, 3, 4]);
+    const length = Math.hypot(...rotations.subarray(0, 4));
+    for (let channel = 0; channel < 3; channel++) {
+        assert.ok(Math.abs(model.gpuScaleRotations[3 + channel] - rotations[1 + channel] / length) < 1e-7);
+    }
     assert.equal(model.gpuScaleRotations.at(-1), 0);
 });

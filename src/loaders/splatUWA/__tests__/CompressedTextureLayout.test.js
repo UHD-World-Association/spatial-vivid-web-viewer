@@ -32,3 +32,11 @@ test('degree-3 shader evaluates all seven l=3 coefficients', () => {
     assert.match(textureShader, /getDataUV\(12, 11/);
     assert.match(textureShader, /SH_C3\[6\].*sh15/);
 });
+
+test('compressed SH=0 omits SH evaluation while degree three keeps per-coefficient RGB bounds', () => {
+    const zeroShader = SplatMaterial.buildVertexShaderBase(false, false, 0, true);
+    assert.doesNotMatch(zeroShader, /sh1 = GetAstcSHCoef/);
+    assert.equal(SplatMaterial.getUniforms(false, false, 0, 1, false, true).sphericalHarmonicsDegree.value, 0);
+    const shader = SplatMaterial.buildVertexShaderBase(false, false, 3, true);
+    assert.match(shader, /astcQuantRanges\[rangeIndex\] \+ astcQuantMins\[rangeIndex\]/);
+});

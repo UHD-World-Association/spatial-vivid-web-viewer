@@ -42,8 +42,6 @@ export class SplatMaterial {
             uniform int astcSingleWidth;
             uniform int astcSingleHeight;
             uniform int astcTextureWidth;
-        uniform vec3 astcQuantMin;
-        uniform vec3 astcQuantRange;
         uniform vec3 astcQuantMins[15];
         uniform vec3 astcQuantRanges[15];
             uniform vec2 astcUVTextureSize;
@@ -684,8 +682,6 @@ export class SplatMaterial {
                 'astcSingleWidth': { 'type': 'i', 'value': 0 },
                 'astcSingleHeight': { 'type': 'i', 'value': 0 },
                 'astcTextureWidth': { 'type': 'i', 'value': 0 },
-            'astcQuantMin': { 'type': 'v3', 'value': new THREE.Vector3() },
-            'astcQuantRange': { 'type': 'v3', 'value': new THREE.Vector3() },
             'astcQuantMins': { 'type': 'v3v', 'value': Array.from({ length: 15 }, () => new THREE.Vector3()) },
             'astcQuantRanges': { 'type': 'v3v', 'value': Array.from({ length: 15 }, () => new THREE.Vector3()) },
                 'astcUVTextureSize': { 'type': 'v2', 'value': new THREE.Vector2(1024, 1024) }

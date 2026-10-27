@@ -12,6 +12,7 @@ import {
     TextureBuildCapabilities,
     TextureStrategy
 } from './TextureStrategy.js';
+import { resolveRenderShDegree } from './SphericalHarmonicsQuantization.js';
 import { copyCoefficientMajorRgbToChannelMajor } from './SphericalHarmonicsLayout.js';
 import { processDecodedModel } from './postprocess/UwaPostprocess.js';
 
@@ -1157,12 +1158,7 @@ export class SplatUWALoader {
             try {
                 const textureStrategy = previewData?.compressedTextureData ?
                     normalizeTextureStrategy(previewData.compressedTextureData.format, preferredTextureStrategy) : TextureStrategy.CPU;
-                const hasCompressedTexture = !!previewData?.compressedTextureData;
-                const requestedShDegree = Number.isInteger(sphericalHarmonicsDegree) ?
-                    Math.max(0, Math.min(3, sphericalHarmonicsDegree)) : Math.max(0, Math.min(3, previewData?.shDegree || 0));
-                const renderShDegree = hasCompressedTexture ?
-                    Math.max(1, Math.min(3, previewData.shDegree || requestedShDegree || 1, Math.max(1, requestedShDegree))) :
-                    Math.max(0, Math.min(3, previewData?.shDegree || 0, requestedShDegree));
+                const renderShDegree = resolveRenderShDegree(previewData?.shDegree ?? 0, sphericalHarmonicsDegree);
                 const result = processDecodedModel(previewData, {
                     minimumAlpha, textureStrategy, shDegree: renderShDegree
                 });
@@ -1235,11 +1231,7 @@ export class SplatUWALoader {
             if (textureStrategy === TextureStrategy.CPU && hasCompressedTexture) {
                 throw new Error('CPU texture strategy unexpectedly returned compressed texture bytes.');
             }
-            const requestedShDegree = Number.isInteger(sphericalHarmonicsDegree) ?
-                Math.max(0, Math.min(3, sphericalHarmonicsDegree)) : Math.max(0, Math.min(3, data.shDegree));
-            const renderShDegree = hasCompressedTexture ?
-                Math.max(1, Math.min(3, data.shDegree, Math.max(1, requestedShDegree))) :
-                Math.max(0, Math.min(3, data.shDegree, requestedShDegree));
+            const renderShDegree = resolveRenderShDegree(data.shDegree, sphericalHarmonicsDegree);
             if (!hasCompressedTexture && renderShDegree > 0 &&
                 (!data.featuresRest || data.featuresRest.length !== splatCount * 45)) {
                 throw new Error('CPU texture fallback returned incomplete spherical harmonics data.');

@@ -37,7 +37,8 @@ test('preview uses completed, valid, alpha-visible points in global source order
         }
     }
     assert.deepEqual([...preview.compressedTextureData.uvs], [1002, 1003, 1006, 1007, 1010, 1011]);
-    assert.equal(preview.gpuScaleRotations[3], source.rotations[5]);
+    const sourceLength = Math.hypot(...source.rotations.subarray(4, 8));
+    assert.equal(preview.gpuScaleRotations[3], Math.fround(source.rotations[5] / sourceLength));
     // A real transferable preview must not detach any canonical final-model buffer.
     const transfer = [preview.positions, preview.scales, preview.rotations, preview.colors, preview.featuresRest,
         preview.gpuScaleRotations, preview.previewSourcePointIndexes, preview.compressedTextureData.raw,

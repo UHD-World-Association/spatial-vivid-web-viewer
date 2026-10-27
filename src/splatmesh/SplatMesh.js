@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { buildShQuantizationUniforms, resolveRenderShDegree } from '../loaders/splatUWA/SphericalHarmonicsQuantization.js';
 import { SplatMaterial3D } from './SplatMaterial3D.js';
 import { SplatMaterial2D } from './SplatMaterial2D.js';
 import { getCompressedTextureSampleAddress } from './SplatMaterial.js';
@@ -102,8 +103,9 @@ function validateCompressedTexturePayload(payload) {
             `Compressed texture payload ${format} has ${raw.byteLength} bytes; expected ${expectedRawSize}.`
         );
     }
-    if (payload.uvs instanceof Uint32Array && payload.uvs.length >= 2) {
-        const shDegree = Math.max(1, Math.min(3, Number(payload.shDegree) || 1));
+    const shDegree = resolveRenderShDegree(payload.shDegree ?? 1, payload.shDegree);
+    const quantization = buildShQuantizationUniforms(payload.shnMins, payload.shnMaxs, shDegree);
+    if (shDegree > 0 && payload.uvs instanceof Uint32Array && payload.uvs.length >= 2) {
         const coefficientCount = getSphericalHarmonicsComponentCountForDegree(shDegree) / 3;
         const lastAddress = getCompressedTextureSampleAddress(
             payload.uvs[0], payload.uvs[1], coefficientCount - 1,
@@ -115,7 +117,7 @@ function validateCompressedTexturePayload(payload) {
     }
     return {
         format, raw, width, height, layers, blockWidth, blockHeight,
-        singleWidth, singleHeight, threeFormat
+        singleWidth, singleHeight, threeFormat, quantization
     };
 }
 
@@ -1356,7 +1358,6 @@ export class SplatMesh extends THREE.Mesh {
             {
                 const descriptor = validateCompressedTexturePayload(payload);
                 const { format, raw, width, height, layers, singleWidth, singleHeight, threeFormat } = descriptor;
-                const { shnMin, shnMax } = payload;
                 const uploadQueuedAt = performance.now();
                 console.log(
                     `[Compressed Texture Upload] Format: ${format}, Width: ${width}, Height: ${height}, ` +
@@ -1390,26 +1391,12 @@ export class SplatMesh extends THREE.Mesh {
                     'byteLength': raw.byteLength
                 };
 
-                // Set the dequantization parameters (minimum and range).
-                const range = new THREE.Vector3(shnMax - shnMin, shnMax - shnMin, shnMax - shnMin);
-                const min = new THREE.Vector3(shnMin, shnMin, shnMin);
-                this.material.uniforms.astcQuantRange.value.copy(range);
-                this.material.uniforms.astcQuantMin.value.copy(min);
-                const quantMins = this.material.uniforms.astcQuantMins?.value;
-                const quantRanges = this.material.uniforms.astcQuantRanges?.value;
-                if (quantMins && quantRanges && payload.shnMins?.length >= 45 && payload.shnMaxs?.length >= 45) {
-                    for (let coefficient = 0; coefficient < 15; coefficient++) {
-                        const base = coefficient * 3;
-                        const minValue = new THREE.Vector3(payload.shnMins[base], payload.shnMins[base + 1], payload.shnMins[base + 2]);
-                        const maxValue = new THREE.Vector3(payload.shnMaxs[base], payload.shnMaxs[base + 1], payload.shnMaxs[base + 2]);
-                        quantMins[coefficient].copy(minValue);
-                        quantRanges[coefficient].copy(maxValue).sub(minValue);
-                    }
-                } else if (quantMins && quantRanges) {
-                    for (let coefficient = 0; coefficient < 15; coefficient++) {
-                        quantMins[coefficient].copy(min);
-                        quantRanges[coefficient].copy(range);
-                    }
+                // Each texture region is one SH coefficient with independent RGB bounds.
+                const quantMins = this.material.uniforms.astcQuantMins.value;
+                const quantRanges = this.material.uniforms.astcQuantRanges.value;
+                for (let coefficient = 0; coefficient < 15; coefficient++) {
+                    quantMins[coefficient].fromArray(descriptor.quantization.min, coefficient * 3);
+                    quantRanges[coefficient].fromArray(descriptor.quantization.range, coefficient * 3);
                 }
 
                 // 4. Create the UV lookup texture (RG32UI).

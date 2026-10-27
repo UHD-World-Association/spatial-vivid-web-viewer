@@ -1,3 +1,4 @@
+import { readShQuantizationRanges } from './SphericalHarmonicsQuantization.js';
 import createSplatUWAWasm from './splat_uwa_wasm.js';
 import {
     classifyWebCodecsFastPath,
@@ -1724,9 +1725,7 @@ export function buildPreviewData(model) {
             preview.gpuScaleRotations[g] = scales[s];
             preview.gpuScaleRotations[g + 1] = scales[s + 1];
             preview.gpuScaleRotations[g + 2] = scales[s + 2];
-            preview.gpuScaleRotations[g + 3] = rotations[r + 1];
-            preview.gpuScaleRotations[g + 4] = rotations[r + 2];
-            preview.gpuScaleRotations[g + 5] = rotations[r + 3];
+            packQuaternionXyz(rotations, r, preview.gpuScaleRotations, g + 3);
         }
     }
     return preview;
@@ -1836,6 +1835,20 @@ function handleShardResult(record, message, coordinatorReceiveAbsMs) {
     }
 }
 
+// The shader reconstructs positive W. Normalize WXYZ and choose the equivalent
+// quaternion with W >= 0 before dropping W; flipping W alone changes rotation.
+function packQuaternionXyz(rotations, offset, destination, destinationOffset) {
+    const w = rotations[offset];
+    const x = rotations[offset + 1];
+    const y = rotations[offset + 2];
+    const z = rotations[offset + 3];
+    const length = Math.sqrt(w * w + x * x + y * y + z * z);
+    const factor = length > 0 ? (w < 0 ? -1 : 1) / length : 0;
+    destination[destinationOffset] = x * factor;
+    destination[destinationOffset + 1] = y * factor;
+    destination[destinationOffset + 2] = z * factor;
+}
+
 export function buildGpuScaleRotations(model) {
     if (!model.postprocessCompaction || !model.compressedTextureData) return;
     const packedLength = gpuScaleRotationPackedArrayLength(model.pointCount);
@@ -1852,11 +1865,7 @@ export function buildGpuScaleRotations(model) {
             packed[packedOffset] = model.scales[scaleOffset];
             packed[packedOffset + 1] = model.scales[scaleOffset + 1];
             packed[packedOffset + 2] = model.scales[scaleOffset + 2];
-            // The public UWA rotation layout is w,x,y,z. The shader input only
-            // needs x,y,z and reconstructs w from the unit quaternion constraint.
-            packed[packedOffset + 3] = model.rotations[rotationOffset + 1];
-            packed[packedOffset + 4] = model.rotations[rotationOffset + 2];
-            packed[packedOffset + 5] = model.rotations[rotationOffset + 3];
+            packQuaternionXyz(model.rotations, rotationOffset, packed, packedOffset + 3);
         }
         model.gpuScaleRotations = packed;
     } catch (_) {
@@ -2441,14 +2450,9 @@ async function decodeTextureStrategy(request, textureStrategyValue) {
         const auxiliaryCopyStartedAt = performance.now();
         const auxiliaryCopyStartedAbsMs = absoluteNowMs();
         const metadata = Module.HEAPU8.slice(prepared.metadataPtr, prepared.metadataPtr + prepared.metadataSize).buffer;
-        const shnMins = prepared.shnMinsCount > 0 && prepared.shnMinsPtr > 0 ?
-            new Float32Array(Module.HEAPF32.slice(prepared.shnMinsPtr >>> 2,
-                (prepared.shnMinsPtr >>> 2) + prepared.shnMinsCount)) : new Float32Array(0);
-        const shnMaxs = prepared.shnMaxsCount > 0 && prepared.shnMaxsPtr > 0 ?
-            new Float32Array(Module.HEAPF32.slice(prepared.shnMaxsPtr >>> 2,
-                (prepared.shnMaxsPtr >>> 2) + prepared.shnMaxsCount)) : new Float32Array(0);
         let compressedTextureData = null;
         if (textureStrategy !== TextureStrategy.CPU) {
+            const { shnMins, shnMaxs } = readShQuantizationRanges(Module, prepared);
             const raw = prepared.astcRawSize > 0 ?
                 Module.HEAPU8.slice(prepared.astcRawPtr, prepared.astcRawPtr + prepared.astcRawSize) : null;
             const uvs = prepared.astcUvCount > 0 ?
