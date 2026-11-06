@@ -172,8 +172,11 @@ bool transcodeAstcToBc(const std::vector<uint8_t>& astcFile,
         return false;
     }
 
-    const uint32_t blocksX = (width + blockWidth - 1) / blockWidth;
-    const uint32_t blocksY = (height + blockHeight - 1) / blockHeight;
+    // BC3 and BC7 always encode 4x4 pixels per block, independently of the
+    // source ASTC footprint. This grid also defines the output row stride.
+    constexpr uint32_t bcBlockSide = 4;
+    const uint32_t blocksX = (width + bcBlockSide - 1) / bcBlockSide;
+    const uint32_t blocksY = (height + bcBlockSide - 1) / bcBlockSide;
     // astcenc's decompressor already uses a shared work allocator. Calling it
     // from several freshly-created pthreads adds contention in the browser
     // build, so keep this phase serial and parallelize only the independent BC
@@ -198,7 +201,7 @@ bool transcodeAstcToBc(const std::vector<uint8_t>& astcFile,
     result.astcDecodeMs = elapsedMs(decodeStart);
 
     size_t outputBytes = 0;
-    if (!checkedBlockBytes(width, height, 4, 4, outputBytes)) {
+    if (!checkedBlockBytes(width, height, bcBlockSide, bcBlockSide, outputBytes)) {
         error = "BC texture dimensions exceed addressable memory";
         return false;
     }

@@ -212,6 +212,8 @@ try {
         "-s", "MODULARIZE=1"
         "-s", "EXPORT_ES6=1"
         "-s", "ALLOW_MEMORY_GROWTH=1"
+        # Preserve memory growth without resizable views (Emscripten issue #27241).
+        "-s", "GROWABLE_ARRAYBUFFERS=0"
         "-s", "FILESYSTEM=0"
         "-s", "ENVIRONMENT=web,worker"
         "-s", "EXPORTED_RUNTIME_METHODS=HEAPF32,HEAPU8,HEAPU32,getExceptionMessage"
@@ -277,6 +279,11 @@ try {
     Invoke-CheckedCommand -Command "em++" -Arguments $kernelArgs
 
     Write-Host "[STEP 6/6] Auditing generated artifacts..."
+    foreach ($jsArtifact in @($coordinatorOutput, $pthreadCoordinatorOutput, $kernelOutput)) {
+        if (Select-String -LiteralPath $jsArtifact -Pattern 'toResizableBuffer' -Quiet) {
+            throw "Resizable WASM views would break mobile TextDecoder in $jsArtifact."
+        }
+    }
     $threadPattern = 'SharedArrayBuffer|Atomics\.|pthread_create|PThread\.'
     foreach ($jsArtifact in @($coordinatorOutput, $kernelOutput)) {
         if (Select-String -LiteralPath $jsArtifact -Pattern $threadPattern -Quiet) {

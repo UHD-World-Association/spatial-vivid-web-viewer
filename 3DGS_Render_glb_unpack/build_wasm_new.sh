@@ -207,6 +207,9 @@ LINK_FLAGS=(
     "-s" "MODULARIZE=1"
     "-s" "EXPORT_ES6=1"
     "-s" "ALLOW_MEMORY_GROWTH=1"
+    # Keep memory growth, but avoid resizable views rejected by mobile TextDecoder.
+    # Emscripten 6.0.2 enables these views by default (upstream issue #27241).
+    "-s" "GROWABLE_ARRAYBUFFERS=0"
     "-s" "FILESYSTEM=0"
     "-s" "ENVIRONMENT=web,worker"
     "-s" "EXPORTED_RUNTIME_METHODS=HEAPF32,HEAPU8,HEAPU32,getExceptionMessage"
@@ -273,6 +276,12 @@ em++ \
     -o "$OUTPUT_DIR/splat_uwa_reconstruction_wasm.js"
 
 echo "[6/6] Auditing generated artifacts..."
+if grep -Eq "toResizableBuffer" \
+    "$OUTPUT_DIR/splat_uwa_wasm.js" "$OUTPUT_DIR/splat_uwa_wasm_pthread.js" \
+    "$OUTPUT_DIR/splat_uwa_reconstruction_wasm.js"; then
+    echo "[ERROR] Resizable WASM views would break TextDecoder on mobile browsers" >&2
+    exit 1
+fi
 if grep -En "SharedArrayBuffer|Atomics\\.|pthread_create|PThread\\." \
     "$OUTPUT_DIR/splat_uwa_wasm.js" "$OUTPUT_DIR/splat_uwa_reconstruction_wasm.js"; then
     echo "[ERROR] Thread/shared-memory runtime detected in generated JavaScript" >&2
